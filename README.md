@@ -298,6 +298,12 @@ In each MRA, every `<rom>` element that has a `zip="…"` attribute becomes a **
 - A path prefix such as `hbmame/foo.zip` or `mame/foo.zip` is kept as a hint for where to look and where to upload.
 - Every `<part crc="…">` inside the `<rom>` (including parts nested in `<interleave>`) adds a required CRC. A part without a CRC but with a `name` adds a required file name.
 - A `<part zip="other.zip">` with its own `zip` attribute starts a separate requirement for that zip.
+- Several `<rom>` elements with the **same `index`** are either/or options, e.g. a merged and a non-merged zip:
+  ```xml
+  <rom index="0" zip="twotiger.zip"  type="merged">
+  <rom index="0" zip="twotigerc.zip" type="nonmerged">
+  ```
+  They become one requirement, shown as `twotiger.zip or twotigerc.zip`, that is met when any option is met.
 - `<rom>` elements without `zip` (inline hex data, NVRAM, etc.) are ignored.
 
 The game name comes from the MRA's `<name>` element, or from the file name if that's missing.
@@ -405,6 +411,9 @@ This makes it easy to use in scripts, e.g. `python mister_rom_audit.py || notify
 **`Authentication failed`**
 Check `user` and `password`. The stock MiSTer login is `root` / `1`. If you changed it, make sure `MISTER_PASSWORD` isn't set to an old value.
 
+**`error: local ROM path does not exist (not mounted?)`** / **`error: no .zip files found`**
+`roms.path` (or `roms.hbmame_path`) points to a folder that doesn't exist or contains no zips. Usually the NAS or USB drive isn't mounted, or the config still has the example path. The tool stops here instead of reporting every game as missing.
+
 **`cannot list MRAs in /media/fat/_Arcade`**
 Check `mister.mra_dir`. MRAs live in `_Arcade/`. `_Arcade/cores/` holds only `.rbf` cores.
 
@@ -418,6 +427,7 @@ The tool already accepts mixed-case tags (`<rom>` … `</ROM>`), which the MiSTe
 - The file name must match the name in the MRA (case doesn't matter). `Pac-Man.zip` ≠ `pacman.zip`.
 - Make sure the zip is under `roms.path` or `roms.hbmame_path`.
 - If two local folders have the same zip name, the first one found wins.
+- With a **merged** local set, clone ROMs live inside the parent zip (e.g. Ring King inside `kingofb.zip`). If the MRA only lists the clone zip (`zip="ringking.zip"`), the MiSTer won't look in the parent either. You need a non-merged `ringking.zip`.
 
 **`--crc` says a zip is incomplete**
 Your ROM set is probably from a different MAME version than the MRA expects. Get the set version the MRA was made for (MiSTer arcade MRAs usually follow a specific MAME release). If your local copy is the right one, use `--fix-incomplete`.

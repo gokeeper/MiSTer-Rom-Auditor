@@ -45,12 +45,21 @@ class Requirement:
     zips: list[ZipRef]
     crcs: set[int] = field(default_factory=set)
     names: set[str] = field(default_factory=set)   # parts that have no crc
+    # Several <rom> elements with the same index are either/or options (e.g. a
+    # merged and a non-merged zip). Each option is the list of requirements of
+    # one <rom>; zips then holds the union of all options' zips.
+    alts: list[list[Requirement]] | None = None
 
     @property
     def beta(self) -> bool:
         return all(z.key == BETA_KEY for z in self.zips)
 
+    def leaves(self) -> list[Requirement]:
+        return [r for opt in self.alts for r in opt] if self.alts else [self]
+
     def label(self) -> str:
+        if self.alts:
+            return " or ".join(" + ".join(r.label() for r in opt) for opt in self.alts)
         return "|".join(z.name for z in self.zips)
 
 
@@ -87,8 +96,8 @@ def parse_mra(data: bytes, rel_path: str) -> Game:
         if any(k != k.lower() for k in el.attrib):
             el.attrib = {k.lower(): v for k, v in el.attrib.items()}
     name = (root.findtext("name") or "").strip() or posixpath.splitext(posixpath.basename(rel_path))[0]
-    reqs: list[Requirement] = []
-    for rom in root.iter("rom"):
+    by_index: dict[object, list[list[Requirement]]] = {}
+    for n, rom in enumerate(root.iter("rom")):
         zip_attr = rom.get("zip")
         if not zip_attr or not parse_zip_attr(zip_attr):
             continue
@@ -112,7 +121,20 @@ def parse_mra(data: bytes, rel_path: str) -> Game:
                     pass
             if pname:
                 req.names.add(pname.lower())
-        reqs.extend(r for r in groups.values() if r.zips)
+        index = (rom.get("index") or "").strip() or ("noindex", n)
+        by_index.setdefault(index, []).append([r for r in groups.values() if r.zips])
+
+    reqs: list[Requirement] = []
+    for options in by_index.values():
+        if len(options) == 1:
+            reqs.extend(options[0])
+        else:
+            zips: dict[str, ZipRef] = {}
+            for opt in options:
+                for r in opt:
+                    for z in r.zips:
+                        zips.setdefault(z.key, z)
+            reqs.append(Requirement(zips=list(zips.values()), alts=options))
     return Game(mra=rel_path, name=name, reqs=reqs)
 
 
@@ -252,12 +274,14 @@ def scan_local(paths: list[tuple[str, str]]) -> tuple[dict[str, LocalZip], dict[
         if not root_dir:
             continue
         if not os.path.isdir(root_dir):
-            log(f"warning: local ROM path does not exist: {root_dir}")
-            continue
+            raise SystemExit(f"error: local ROM path does not exist (not mounted?): {root_dir}")
         for dirpath, _, files in os.walk(root_dir):
             for fn in files:
                 if fn.lower().endswith(".zip"):
                     found[kind].setdefault(fn.lower(), LocalZip(os.path.join(dirpath, fn), kind))
+    if not found[MAME] and not found[HBMAME]:
+        raise SystemExit("error: no .zip files found in the configured local ROM path(s): "
+                         + ", ".join(p for p, _ in paths if p))
     return found[MAME], found[HBMAME]
 
 
@@ -301,6 +325,8 @@ class Resolver:
 
     def satisfied(self, req: Requirement, copied: dict[str, str], replaced: dict[str, str]) -> bool:
         """copied/replaced map zip key -> local path of the file that is (or will be) on MiSTer."""
+        if req.alts:
+            return any(all(self.satisfied(r, copied, replaced) for r in opt) for opt in req.alts)
         present = []
         for ref in req.zips:
             if ref.key in copied or ref.key in replaced:
@@ -337,7 +363,7 @@ class Resolver:
         """CRC mode: remote zips whose local copy covers more of an unmet requirement."""
         plan: dict[str, LocalZip] = {}
         for g in games:
-            for req in g.reqs:
+            for req in (leaf for r in g.reqs for leaf in r.leaves()):
                 if self.satisfied(req, copied, {}):
                     continue
                 for ref in req.zips:

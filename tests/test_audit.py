@@ -63,6 +63,27 @@ class BetaKeyTest(unittest.TestCase):
         self.assertEqual([r.beta for r in g.reqs], [False, True])
 
 
+class SameIndexAlternativesTest(unittest.TestCase):
+    DATA = b'''<misterromdescription><name>Two Tigers</name>
+      <rom index="0" zip="twotiger.zip" type="merged"><part crc="0000000a"/></rom>
+      <rom index="0" zip="twotigerc.zip" type="nonmerged"><part crc="0000000a"/></rom>
+      <rom index="1"><part>00</part></rom></misterromdescription>'''
+
+    def test_parsed_as_one_either_or_requirement(self):
+        g = parse_mra(self.DATA, "tt.mra")
+        self.assertEqual(len(g.reqs), 1)
+        self.assertEqual([z.key for z in g.reqs[0].zips], ["twotiger.zip", "twotigerc.zip"])
+        self.assertEqual(g.reqs[0].label(), "twotiger.zip or twotigerc.zip")
+
+    def test_either_option_satisfies(self):
+        g = parse_mra(self.DATA, "tt.mra")
+        for present in ("twotiger.zip", "twotigerc.zip"):
+            r = Resolver({MAME: {present: "/r/" + present}, HBMAME: {}}, {MAME: {}, HBMAME: {}})
+            self.assertTrue(r.satisfied(g.reqs[0], {}, {}))
+        r = Resolver({MAME: {}, HBMAME: {}}, {MAME: {}, HBMAME: {}})
+        self.assertFalse(r.satisfied(g.reqs[0], {}, {}))
+
+
 class ResolveTest(unittest.TestCase):
     def setUp(self):
         self.game = parse_mra(MRA, "msp.mra")
