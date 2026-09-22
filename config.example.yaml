@@ -1,0 +1,13 @@
+# Copy to config.yaml and edit.
+mister:
+  host: 192.168.1.50
+  port: 22
+  user: root
+  password: "1"            # MiSTer default; or set MISTER_PASSWORD env var; omit to use SSH keys
+  mra_dir: /media/fat/_Arcade           # scanned recursively for *.mra (symlinks skipped)
+  mame_dir: /media/fat/games/mame
+  hbmame_dir: /media/fat/games/hbmame
+
+roms:
+  path: /mnt/roms/mame                  # local MAME zips (searched recursively)
+  hbmame_path: /mnt/roms/hbmame         # optional; zips found here are uploaded to hbmame_dir
