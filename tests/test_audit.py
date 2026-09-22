@@ -201,6 +201,34 @@ class RebuildTest(unittest.TestCase):
             self.assertEqual({n: zf.read(n) for n in zf.namelist()}, RING)
         self.assertFalse(os.path.exists(out + ".tmp"))
 
+    def test_index_cache_keeps_other_roots_and_drops_deleted(self):
+        cache = os.path.join(self.dir, "cache", "idx.json")
+        other = os.path.join(self.dir, "other")
+        os.makedirs(other)
+        other_zip = os.path.join(other, "x.zip")
+        with zipfile.ZipFile(other_zip, "w") as zf:
+            zf.writestr("x", b"x")
+        CrcIndex(cache).build([other_zip], roots=[other])           # "config 2"
+        CrcIndex(cache).build([self.kingofb, self.decoy], roots=[self.dir + "/nonexistent"])
+        # config 2's entry survived config 1's run: nothing to re-read
+        self.assertEqual(CrcIndex(cache).build([other_zip], roots=[other]), 0)
+        # a zip deleted from config 2's root is dropped from the cache
+        os.remove(other_zip)
+        CrcIndex(cache).build([], roots=[other])
+        import json
+        with open(cache) as f:
+            self.assertNotIn(other_zip, json.load(f)["zips"])
+
+    def test_index_checkpoint_saves_progress(self):
+        cache = os.path.join(self.dir, "cache", "idx.json")
+        idx = CrcIndex(cache)
+        idx.CHECKPOINT = 1
+        saves = []
+        orig = idx._save
+        idx._save = lambda e: (saves.append(len(e)), orig(e))
+        idx.build([self.decoy, self.kingofb])
+        self.assertEqual(saves[:2], [1, 2])
+
     def test_index_cache_roundtrip(self):
         cache = os.path.join(self.dir, "cache", "idx.json")
         self.assertEqual(CrcIndex(cache).build([self.kingofb]), 1)

@@ -532,46 +532,71 @@ class CrcIndex:
         self.cache_file = cache_file
         self.by_crc: dict[int, list[tuple[str, str, int]]] = {}
 
-    def build(self, zip_paths: list[str]) -> int:
-        """Index zip_paths (in priority order); return how many zips had to be (re)read."""
-        cached: dict = {}
+    CHECKPOINT = 2000   # save the cache every N zips read, so an interrupted run keeps its progress
+
+    def build(self, zip_paths: list[str], roots: list[str] = ()) -> int:
+        """Index zip_paths (in priority order); return how many zips had to be (re)read.
+
+        Cache entries for other paths are kept (another config may use them), except
+        entries under one of `roots` that are no longer in zip_paths: those zips were deleted.
+        """
+        entries: dict = {}
         if self.cache_file:
             try:
                 with open(self.cache_file) as f:
                     data = json.load(f)
                 if data.get("version") == self.VERSION:
-                    cached = data["zips"]
+                    entries = data["zips"]
             except (OSError, ValueError, KeyError):
                 pass
-        fresh: dict = {}
-        reread = 0
-        for n, path in enumerate(zip_paths, 1):
+        current = set(zip_paths)
+        prefixes = tuple(os.path.join(os.path.abspath(r), "") for r in roots if r)
+        stale = [p for p in entries if p not in current and p.startswith(prefixes)] if prefixes else []
+        for p in stale:
+            del entries[p]
+
+        to_read = []
+        for path in zip_paths:
             try:
                 st = os.stat(path)
             except OSError:
                 continue
-            entry = cached.get(path)
-            if not entry or entry[0] != st.st_size or entry[1] != st.st_mtime_ns:
-                try:
-                    with zipfile.ZipFile(path) as zf:
-                        members = [[i.CRC, i.filename, i.file_size] for i in zf.infolist() if not i.is_dir()]
-                except (zipfile.BadZipFile, OSError) as e:
-                    log(f"  skipping unreadable zip {path}: {e}")
-                    continue
-                entry = [st.st_size, st.st_mtime_ns, members]
-                reread += 1
-            fresh[path] = entry
-            for crc, name, size in entry[2]:
-                self.by_crc.setdefault(crc, []).append((path, name, size))
-            if n % 1000 == 0:
-                log(f"  {n}/{len(zip_paths)} zips indexed")
-        if self.cache_file and (reread or fresh.keys() != cached.keys()):
-            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
-            tmp = self.cache_file + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump({"version": self.VERSION, "zips": fresh}, f)
-            os.replace(tmp, self.cache_file)
-        return reread
+            e = entries.get(path)
+            if not e or e[0] != st.st_size or e[1] != st.st_mtime_ns:
+                to_read.append((path, st))
+        log(f"  {len(zip_paths)} zips: {len(zip_paths) - len(to_read)} from cache, {len(to_read)} to read")
+
+        for n, (path, st) in enumerate(to_read, 1):
+            try:
+                with zipfile.ZipFile(path) as zf:
+                    members = [[i.CRC, i.filename, i.file_size] for i in zf.infolist() if not i.is_dir()]
+            except (zipfile.BadZipFile, OSError) as e:
+                log(f"  skipping unreadable zip {path}: {e}")
+                entries.pop(path, None)
+                continue
+            entries[path] = [st.st_size, st.st_mtime_ns, members]
+            if n % 500 == 0 or n == len(to_read):
+                log(f"  read {n}/{len(to_read)}")
+            if n % self.CHECKPOINT == 0:
+                self._save(entries)
+        if to_read or stale:
+            self._save(entries)
+
+        for path in zip_paths:
+            e = entries.get(path)
+            if e:
+                for crc, name, size in e[2]:
+                    self.by_crc.setdefault(crc, []).append((path, name, size))
+        return len(to_read)
+
+    def _save(self, entries: dict):
+        if not self.cache_file:
+            return
+        os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+        tmp = self.cache_file + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": self.VERSION, "zips": entries}, f)
+        os.replace(tmp, self.cache_file)
 
 
 @dataclass
@@ -742,7 +767,8 @@ def main(argv=None) -> int:
     ap.add_argument("--rebuild", action="store_true",
                     help="build zips that exist nowhere from CRC-matching files in other local zips")
     ap.add_argument("--no-cache", action="store_true",
-                    help="ignore the MRA cache and download/parse every MRA again")
+                    help="ignore the MRA cache and download/parse every MRA again "
+                         "(does not affect the --rebuild CRC index, which revalidates itself)")
     ap.add_argument("--report", metavar="FILE", help="write a JSON report to FILE")
     ap.add_argument("-v", "--verbose", action="store_true", help="list every game in the report")
     args = ap.parse_args(argv)
@@ -818,9 +844,9 @@ def main(argv=None) -> int:
         if args.rebuild:
             def get_index():
                 zip_paths = list(dict.fromkeys(lz.path for kind in (MAME, HBMAME) for lz in local[kind].values()))
-                log(f"Indexing {len(zip_paths)} local zips by CRC (cached after the first run) ...")
+                log("Indexing local zips by CRC ...")
                 idx = CrcIndex(os.path.join(cache_dir(), "crc_index.json"))
-                log(f"  {idx.build(zip_paths)} zip(s) read, rest from cache")
+                idx.build(zip_paths, roots=[*rom_paths, *([build_path] if build_path else [])])
                 return idx
 
             planned_all = {**planned_copies, **{k: lz.path for k, lz in replace_plan.items()}}

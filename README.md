@@ -175,7 +175,7 @@ python mister_rom_audit.py --dry-run > audit.txt
 | `--crc` | Also verify that each zip contains the CRCs listed in the MRA `<part>` entries. Slower: it opens every referenced zip on the MiSTer over SFTP. |
 | `--fix-incomplete` | Requires `--crc`. When a zip on the MiSTer fails the CRC check and your local zip of the same name covers more of the required parts, overwrite the MiSTer copy. **This overwrites files.** Try it with `--dry-run` first. |
 | `--rebuild` | For ROM sets still missing after copying, build the first zip in the MRA's list from CRC-matching files in your other local zips, then upload it. See [Rebuilding missing zips](#3-rebuilding-missing-zips). With `--dry-run`, only shows what would be built. |
-| `--no-cache` | Ignore the MRA cache: download and parse every MRA again (the cache is then rewritten). Normally not needed. |
+| `--no-cache` | Ignore the **MRA cache**: download and parse every MRA again (the cache is then rewritten). It does **not** affect the `--rebuild` CRC index, which revalidates itself (see below). Normally not needed. |
 | `--report FILE` | Write a JSON report to `FILE`. |
 | `-v`, `--verbose` | Also list every OK game and every still-missing game by name. |
 
@@ -324,7 +324,7 @@ MRAs can be large: some embed megabytes of inline ROM data, and a typical `_Arca
 2. MRAs whose size and mtime match the cache are taken from it, already parsed.
 3. Only new or changed MRAs are downloaded, in one `tar` stream, and parsed. Deleted MRAs are dropped from the cache.
 
-The cache lives in `~/.cache/mister-rom-audit/mra-<id>.json` (or under `$XDG_CACHE_HOME`), one file per MiSTer host and `mra_dir`. It is a few MB. It's safe to delete at any time; the next run simply downloads everything again. `--no-cache` does the same for one run.
+The cache lives in `~/.cache/mister-rom-audit/mra-<id>.json` (or under `$XDG_CACHE_HOME`), one file per MiSTer host and `mra_dir`. It is a few MB. It's safe to delete at any time; the next run simply downloads everything again. `--no-cache` does the same for one run. It applies only to this MRA cache, not to the CRC index used by `--rebuild`.
 
 ### 1. MRA parsing
 
@@ -364,7 +364,12 @@ Upload destination:
 With `--rebuild`, ROM sets that are still missing after the copy step get a second chance. This is mainly for **merged** collections: there, a clone's ROMs live inside the parent zip (Ring King inside `kingofb.zip`), but the MRA only asks for `ringking.zip`, and the MiSTer only opens the zips an MRA names.
 
 1. **Pick candidates.** A ROM set qualifies when no zip in its list is on the MiSTer, in your collection or in `build_path`, and every MRA part has a CRC. For same-index either/or entries, the first option that can be fully rebuilt is used.
-2. **Index local zips by CRC.** The tool reads every local zip's file list (the central directory, not the ROM data) and maps each CRC to the zip and file that contain it. The index is cached at `~/.cache/mister-rom-audit/crc_index.json` (or under `$XDG_CACHE_HOME`). On later runs, only zips whose size or modification time changed are re-read. The index is only built when there's something to rebuild.
+2. **Index local zips by CRC.** The tool reads every local zip's file list (the central directory, not the ROM data) and maps each CRC to the zip and file that contain it. The index is only built when there's something to rebuild. It is cached at `~/.cache/mister-rom-audit/crc_index.json` (or under `$XDG_CACHE_HOME`):
+   - **One index for all MiSTers.** The index describes your local ROM collection, not a MiSTer, so a second MiSTer (another config file) reuses it. Only zips whose size or modification time changed are re-read. The log shows e.g. `14032 zips: 14032 from cache, 0 to read`.
+   - **Entries are keyed by full path.** If two configs reach the same share through different paths (e.g. `/nfs/…` vs `/mnt/nfs/…`), each path is indexed once, and both stay cached.
+   - **Deleted zips drop out.** Zips removed from a configured ROM folder are dropped from the index. Entries from other configs' folders are kept.
+   - **Progress is saved.** The cache is saved every 2000 zips read, so an interrupted first index resumes where it stopped.
+   - **Forcing a full re-index.** Delete `crc_index.json`; `--no-cache` does not touch it.
 3. **Match every part.** Each required CRC must be found. When several zips contain a CRC, the zip that supplies the most of the set's parts wins (normally the parent). This avoids picking an unrelated file that happens to share a CRC32. If any part is missing, nothing is built. The report says e.g. `sf2cre.zip: 3/10 parts found locally; missing CRCs 1a2b3c4d, …`.
 4. **Build.** A new zip named after the first zip in the MRA's list (e.g. `ringking.zip`) is written with just the parts the MRA needs. Each file is named after the MRA part's `name=`, and each file's CRC is checked again as it's copied. The zip is written to a `.tmp` file and renamed, and an existing file is never overwritten.
 5. **Upload.** The zip goes to `games/mame` (or `games/hbmame` for an `hbmame/` zip), the same way as a copy.
