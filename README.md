@@ -8,6 +8,13 @@ The tool connects to your MiSTer over SSH. It reads every `.mra` file under `/me
 - games fixed by this run
 - games that are still missing ROMs, and which zips they need
 
+**Merged ROM set? Use `--rebuild`.** Many MRAs ask for a clone zip such as `ringking.zip`. A merged MAME collection doesn't have that file, because the clone's ROMs live inside the parent zip (`kingofb.zip`). The MiSTer only opens the zips an MRA names, so those games won't boot. With `--rebuild`, the tool finds every ROM the MRA needs by CRC in your other local zips and builds the missing zip. It then uploads it and can keep a copy in a separate `build_path` folder. Your collection is only read, never modified. See [Rebuilding missing zips](#3-rebuilding-missing-zips).
+
+```sh
+python mister_rom_audit.py --rebuild --dry-run   # show what would be built, and from which zips
+python mister_rom_audit.py --rebuild
+```
+
 ---
 
 ## Contents
