@@ -39,6 +39,7 @@ The tool connects to your MiSTer over SSH. It reads every `.mra` file under `/me
 - **Dry run.** `--dry-run` shows exactly what would be copied without touching the MiSTer.
 - **Optional CRC audit.** `--crc` checks that each zip actually contains the ROM parts the MRA asks for, so it catches wrong-version or incomplete sets. It reads only the zip's central directory, not the ROM data.
 - **Optional repair.** `--crc --fix-incomplete` overwrites MiSTer zips that fail the CRC check when your local copy covers more of the required parts.
+- **Optional rebuild.** `--rebuild` builds a zip that exists nowhere (e.g. `ringking.zip` when your merged set only has `kingofb.zip`) from CRC-matching files in your other local zips. Your ROM collection is never modified.
 - **Tolerant MRA parsing.** Tag and attribute names are case-insensitive, like the MiSTer's own loader (e.g. `<rom>` … `</ROM>`).
 - **Jotego beta key aware.** `jtbeta.zip` (the Patreon key that unlocks Jotego's beta `jt*` cores) is reported on its own line instead of as a missing ROM set.
 - **JSON report** for scripting or keeping a history.
@@ -86,9 +87,18 @@ mister:
 roms:
   path: /mnt/roms/mame           # local MAME zips, searched recursively   (required*)
   hbmame_path: /mnt/roms/hbmame  # local HBMAME zips (optional)
+  build_path: ~/mister-built-roms  # where --rebuild keeps rebuilt zips (optional)
 ```
 
 \* At least one of `roms.path` / `roms.hbmame_path` must be set.
+
+`roms.path` and `roms.hbmame_path` are **read-only** to this tool: it never writes, renames or deletes anything there.
+
+`roms.build_path` is optional. It holds the zips created by `--rebuild` (see [Rebuilding missing zips](#3-rebuilding-missing-zips)):
+- It must not be the same as, inside, or contain `roms.path` / `roms.hbmame_path`. The tool refuses to run if it is, so rebuilt zips never get mixed into your MAME collection.
+- Rebuilt zips are saved to `build_path/mame/` (or `build_path/hbmame/`), and the folder is created on first use.
+- It is also a ROM **source** on every run, even without `--rebuild`. After you reset an SD card or set up a second MiSTer, saved zips are simply copied. Your main collection is checked first, so a real zip there always wins over a rebuilt one.
+- If it's not set, rebuilt zips are built in a temp folder, uploaded, then deleted. They exist only on the MiSTer.
 
 ### Authentication
 
@@ -129,6 +139,10 @@ python mister_rom_audit.py --crc --dry-run
 # Deep audit + replace incomplete zips on the MiSTer with better local copies
 python mister_rom_audit.py --crc --fix-incomplete
 
+# Also build zips that exist nowhere from files in your other zips (e.g. clones from a merged set)
+python mister_rom_audit.py --rebuild --dry-run
+python mister_rom_audit.py --rebuild
+
 # Full per-game listing and a machine-readable report
 python mister_rom_audit.py -v --report audit.json
 
@@ -152,6 +166,7 @@ python mister_rom_audit.py --dry-run > audit.txt
 | `-n`, `--dry-run` | Audit only. Nothing is uploaded or changed. The report says "would copy" / "would be fulfilled". |
 | `--crc` | Also verify that each zip contains the CRCs listed in the MRA `<part>` entries. Slower: it opens every referenced zip on the MiSTer over SFTP. |
 | `--fix-incomplete` | Requires `--crc`. When a zip on the MiSTer fails the CRC check and your local zip of the same name covers more of the required parts, overwrite the MiSTer copy. **This overwrites files.** Try it with `--dry-run` first. |
+| `--rebuild` | For ROM sets still missing after copying, build the first zip in the MRA's list from CRC-matching files in your other local zips, then upload it. See [Rebuilding missing zips](#3-rebuilding-missing-zips). With `--dry-run`, only shows what would be built. |
 | `--report FILE` | Write a JSON report to `FILE`. |
 | `-v`, `--verbose` | Also list every OK game and every still-missing game by name. |
 
@@ -235,9 +250,11 @@ A zip list is a **search path**, not a list of required files. The MiSTer looks 
 | **on MiSTer** | Referenced zips already in `mame_dir` or `hbmame_dir`. |
 | **copied** | Zips uploaded in this run, with total size. |
 | **absent fallbacks (not needed)** | Not on the MiSTer, but every list that names them is satisfied by another zip. Without `--crc` this is assumed, not verified. |
+| **rebuilt** (`--rebuild`) | Zips built from other local zips and uploaded. The line also says whether they're kept in `build_path`. With `--dry-run`, the size is the uncompressed estimate. |
+| **rebuild not possible** (`--rebuild`) | Missing ROM sets that couldn't be rebuilt. The reason is listed in the "Rebuild not possible" section. |
 | **absent, needed** | Not on the MiSTer or local, and named in a list that is still missing. Getting any one zip from each such list fixes it. |
 
-The four zip lines (on MiSTer + copied + absent fallbacks + absent needed) add up to **Zip files referenced**.
+The zip lines (on MiSTer + copied + rebuilt + absent fallbacks + absent needed) add up to **Zip files referenced**.
 
 ### Jotego beta key (`jtbeta.zip`)
 
@@ -323,7 +340,21 @@ Upload destination:
 - a zip found under `roms.hbmame_path` goes to `hbmame_dir`
 - everything else goes to `mame_dir`, keeping the local file name
 
-### 3. Existence mode vs. CRC mode
+### 3. Rebuilding missing zips
+
+With `--rebuild`, ROM sets that are still missing after the copy step get a second chance. This is mainly for **merged** collections: there, a clone's ROMs live inside the parent zip (Ring King inside `kingofb.zip`), but the MRA only asks for `ringking.zip`, and the MiSTer only opens the zips an MRA names.
+
+1. **Pick candidates.** A ROM set qualifies when no zip in its list is on the MiSTer, in your collection or in `build_path`, and every MRA part has a CRC. For same-index either/or entries, the first option that can be fully rebuilt is used.
+2. **Index local zips by CRC.** The tool reads every local zip's file list (the central directory, not the ROM data) and maps each CRC to the zip and file that contain it. The index is cached at `~/.cache/mister-rom-audit/crc_index.json` (or under `$XDG_CACHE_HOME`). On later runs, only zips whose size or modification time changed are re-read. The index is only built when there's something to rebuild.
+3. **Match every part.** Each required CRC must be found. When several zips contain a CRC, the zip that supplies the most of the set's parts wins (normally the parent). This avoids picking an unrelated file that happens to share a CRC32. If any part is missing, nothing is built. The report says e.g. `sf2cre.zip: 3/10 parts found locally; missing CRCs 1a2b3c4d, …`.
+4. **Build.** A new zip named after the first zip in the MRA's list (e.g. `ringking.zip`) is written with just the parts the MRA needs. Each file is named after the MRA part's `name=`, and each file's CRC is checked again as it's copied. The zip is written to a `.tmp` file and renamed, and an existing file is never overwritten.
+5. **Upload.** The zip goes to `games/mame` (or `games/hbmame` for an `hbmame/` zip), the same way as a copy.
+
+`--dry-run --rebuild` builds the index (reading only zip directories) and shows exactly what would be built and from which zips. Nothing is written.
+
+Hacks, homebrew and bootlegs not in MAME usually can't be rebuilt: their modified ROMs don't exist in a MAME collection. MRAs made for a different MAME version may also list CRCs your set doesn't have. Both cases appear under "Rebuild not possible".
+
+### 4. Existence mode vs. CRC mode
 
 | | Existence (default) | `--crc` |
 |---|---|---|
@@ -333,7 +364,7 @@ Upload destination:
 
 CRC mode combines contents across all zips in the list, in the same way the MiSTer loader searches every listed zip for each part. A split child plus its parent is therefore evaluated correctly.
 
-### 4. Game status
+### 5. Game status
 
 - **OK**: every requirement was met before the run.
 - **Fulfilled**: at least one requirement was unmet before, and all are met after the uploads (or would be, in a dry run).
@@ -368,6 +399,8 @@ CRC mode combines contents across all zips in the list, in the same way the MiST
     "zips_already_present": 1013,
     "zips_copied": 44,
     "zips_replaced": 0,
+    "zips_rebuilt": 0,
+    "rebuild_not_possible": 0,
     "zips_absent_not_needed": 1907,
     "zips_absent_needed": 40,
     "bytes_copied": 182347366,
@@ -375,6 +408,8 @@ CRC mode combines contents across all zips in the list, in the same way the MiST
   },
   "copied": ["1942.zip", "..."],
   "replaced": [],
+  "rebuilt": [{"zip": "ringking.zip", "sources": ["kingofb.zip"], "files": 17, "saved_to": "/home/me/mister-built-roms/mame/ringking.zip"}],
+  "rebuild_not_possible": {"sf2cre.zip": {"reason": "3/10 parts found locally; missing CRCs 1a2b3c4d, ...", "games": ["Street Fighter II': Champion Re-Edit"]}},
   "games_fulfilled": [{"name": "1942 (Revision B)", "mra": "1942.mra"}],
   "games_need_beta_key_only": [{"name": "Street Fighter III 3rd Strike ...", "mra": "_Arcade Offset/_CP System III/..."}],
   "games_still_missing": [
@@ -389,6 +424,8 @@ CRC mode combines contents across all zips in the list, in the same way the MiST
   "parse_errors": {}
 }
 ```
+
+`bytes_copied` is the total uploaded: copies, replacements and rebuilds.
 
 The keys of `unavailable_zips` and `incomplete_zips` (and the entries of `rom_sets_still_missing`) are ROM-set labels: the zip list joined with `|`.
 
@@ -427,7 +464,13 @@ The tool already accepts mixed-case tags (`<rom>` … `</ROM>`), which the MiSTe
 - The file name must match the name in the MRA (case doesn't matter). `Pac-Man.zip` ≠ `pacman.zip`.
 - Make sure the zip is under `roms.path` or `roms.hbmame_path`.
 - If two local folders have the same zip name, the first one found wins.
-- With a **merged** local set, clone ROMs live inside the parent zip (e.g. Ring King inside `kingofb.zip`). If the MRA only lists the clone zip (`zip="ringking.zip"`), the MiSTer won't look in the parent either. You need a non-merged `ringking.zip`.
+- With a **merged** local set, clone ROMs live inside the parent zip (e.g. Ring King inside `kingofb.zip`). If the MRA only lists the clone zip (`zip="ringking.zip"`), the MiSTer won't look in the parent either. Run with `--rebuild` to build `ringking.zip` from `kingofb.zip`, or get a non-merged `ringking.zip`.
+
+**"Rebuild not possible: … parts found locally; missing CRCs …"**
+Some ROM files the MRA needs aren't in any of your local zips. Typical causes: the game is a hack or homebrew that isn't in MAME, or the MRA was made for a different MAME version whose dump has a different CRC.
+
+**`error: roms.build_path must not be the same as, inside, or contain …`**
+Point `build_path` at a separate folder, e.g. `~/mister-built-roms`.
 
 **`--crc` says a zip is incomplete**
 Your ROM set is probably from a different MAME version than the MRA expects. Get the set version the MRA was made for (MiSTer arcade MRAs usually follow a specific MAME release). If your local copy is the right one, use `--fix-incomplete`.
@@ -441,7 +484,8 @@ The SD card or USB drive is full. The partial `.part` file is left behind and ca
 
 - Only zips directly inside `mame_dir` / `hbmame_dir` count as present. Sub-folders there are not searched.
 - Local zips are matched **by file name only**. In existence mode a zip with the right name but wrong contents counts as good; use `--crc` to catch that.
-- Merged sets: if the MRA's zip list doesn't include your merged parent zip, the tool can't know that the parent contains the clone.
+- Merged sets: if the MRA's zip list doesn't include your merged parent zip, the clone is reported missing unless you use `--rebuild`.
+- `--rebuild` matches parts by CRC32 only (MRAs don't give sizes or SHA1s). Preferring the zip that supplies most of the set's parts makes a wrong match very unlikely, but not impossible.
 - CHDs, samples and other non-zip assets are not handled.
 - Symlinked MRAs are skipped by design, to avoid counting `_Organized` duplicates.
 - SSH host keys are not verified.
@@ -461,6 +505,7 @@ The tests cover:
 - MRA parsing: zip search lists, interleaved parts, per-part `zip` overrides, `hbmame/` prefix hints, mixed-case tags
 - existence-mode copy planning
 - CRC-mode evaluation and `--fix-incomplete` replacement planning
+- `--rebuild`: CRC index and cache, donor preference, partial-match reporting, either/or options, zip building, `build_path` safety check
 
 ### Project layout
 

@@ -11,3 +11,4 @@ mister:
 roms:
   path: /mnt/roms/mame                  # local MAME zips (searched recursively)
   hbmame_path: /mnt/roms/hbmame         # optional; zips found here are uploaded to hbmame_dir
+  build_path: ~/mister-built-roms       # optional; --rebuild saves rebuilt zips here (never inside path/hbmame_path)

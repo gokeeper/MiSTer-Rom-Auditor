@@ -1,12 +1,14 @@
 import io
 import os
 import sys
+import tempfile
 import unittest
 import zipfile
+import zlib
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from mister_rom_audit import (HBMAME, MAME, LocalZip, Resolver, parse_mra,  # noqa: E402
-                              read_zip_contents)
+from mister_rom_audit import (HBMAME, MAME, CrcIndex, LocalZip,  # noqa: E402
+                              Resolver, build_zip, parse_mra, plan_rebuilds, read_zip_contents)
 
 MRA = b"""<misterromdescription>
   <name>Ms. Pac-Man (bootleg)</name>
@@ -121,6 +123,103 @@ class ResolveTest(unittest.TestCase):
         repl = r.plan_replacements([game], {})
         self.assertEqual(set(repl), {"mspacman.zip"})
         self.assertTrue(r.satisfied(game.reqs[0], {}, {"mspacman.zip": "/l/mspacman.zip"}))
+
+
+def crc(data: bytes) -> int:
+    return zlib.crc32(data)
+
+
+RING = {"r1.bin": b"ring king 1", "r2.bin": b"ring king 2"}
+PARENT_ONLY = {"k1.bin": b"king of boxer"}
+
+
+def ring_mra(extra_part=b""):
+    parts = b"".join(b'<part crc="%08x" name="%s"/>' % (crc(d), n.encode()) for n, d in RING.items())
+    return b'<misterromdescription><name>Ring King</name><rom index="0" zip="ringking.zip">' \
+        + parts + extra_part + b"</rom></misterromdescription>"
+
+
+class RebuildTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        # merged parent: clone files stored under other names / in a subfolder
+        self.kingofb = os.path.join(self.dir, "kingofb.zip")
+        with zipfile.ZipFile(self.kingofb, "w") as zf:
+            for n, d in PARENT_ONLY.items():
+                zf.writestr(n, d)
+            for n, d in RING.items():
+                zf.writestr("ringking/" + n.upper(), d)
+        # unrelated zip that happens to contain one of the CRCs
+        self.decoy = os.path.join(self.dir, "aaa_decoy.zip")
+        with zipfile.ZipFile(self.decoy, "w") as zf:
+            zf.writestr("x.bin", RING["r1.bin"])
+        self.index = CrcIndex()
+        self.index.build([self.decoy, self.kingofb])
+        self.resolver = Resolver({MAME: {}, HBMAME: {}}, {MAME: {}, HBMAME: {}})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def plan(self, games):
+        return plan_rebuilds(self.resolver, games, {}, lambda: self.index)
+
+    def test_plans_from_parent_and_prefers_best_donor(self):
+        plans, failed = self.plan([parse_mra(ring_mra(), "rk.mra")])
+        self.assertEqual(failed, {})
+        p = plans["ringking.zip"]
+        self.assertEqual(p.sources, ["kingofb.zip"])          # not the decoy
+        self.assertEqual(sorted(m[0] for m in p.members), ["r1.bin", "r2.bin"])
+
+    def test_missing_crc_reports_partial(self):
+        plans, failed = self.plan([parse_mra(ring_mra(b'<part crc="deadbeef" name="x"/>'), "rk.mra")])
+        self.assertEqual(plans, {})
+        reason, games = failed["ringking.zip"]
+        self.assertIn("2/3 parts found", reason)
+        self.assertIn("deadbeef", reason)
+        self.assertEqual(games, ["Ring King"])
+
+    def test_index_not_built_when_nothing_to_rebuild(self):
+        resolver = Resolver({MAME: {"ringking.zip": "/r/ringking.zip"}, HBMAME: {}}, {MAME: {}, HBMAME: {}})
+        plans, failed = plan_rebuilds(resolver, [parse_mra(ring_mra(), "rk.mra")], {},
+                                      lambda: self.fail("index should not be built"))
+        self.assertEqual((plans, failed), ({}, {}))
+
+    def test_alternatives_rebuild_only_first_buildable_option(self):
+        data = ring_mra().replace(b'<rom index="0" zip="ringking.zip">',
+                                  b'<rom index="0" zip="nothere.zip"><part crc="deadbeef"/></rom>'
+                                  b'<rom index="0" zip="ringking.zip">')
+        plans, failed = self.plan([parse_mra(data, "rk.mra")])
+        self.assertEqual(set(plans), {"ringking.zip"})
+        self.assertEqual(failed, {})
+
+    def test_build_zip(self):
+        plans, _ = self.plan([parse_mra(ring_mra(), "rk.mra")])
+        out = os.path.join(self.dir, "ringking.zip")
+        build_zip(plans["ringking.zip"], out)
+        with zipfile.ZipFile(out) as zf:
+            self.assertEqual({n: zf.read(n) for n in zf.namelist()}, RING)
+        self.assertFalse(os.path.exists(out + ".tmp"))
+
+    def test_index_cache_roundtrip(self):
+        cache = os.path.join(self.dir, "cache", "idx.json")
+        self.assertEqual(CrcIndex(cache).build([self.kingofb]), 1)
+        again = CrcIndex(cache)
+        self.assertEqual(again.build([self.kingofb]), 0)       # served from cache
+        self.assertIn(crc(RING["r1.bin"]), again.by_crc)
+
+
+class BuildPathSafetyTest(unittest.TestCase):
+    def test_build_path_inside_collection_rejected(self):
+        import mister_rom_audit as m
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "roms"))
+            cfg = os.path.join(d, "c.yaml")
+            with open(cfg, "w") as f:
+                f.write(f"mister: {{host: x}}\nroms: {{path: {d}/roms, build_path: {d}/roms/built}}\n")
+            with self.assertRaises(SystemExit) as cm:
+                m.main(["-c", cfg, "-n"])
+            self.assertIn("build_path", str(cm.exception))
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import os
 import posixpath
 import re
@@ -16,8 +17,11 @@ import shlex
 import stat
 import sys
 import tarfile
+import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
+from collections import Counter
 from dataclasses import dataclass, field
 
 import yaml
@@ -45,6 +49,7 @@ class Requirement:
     zips: list[ZipRef]
     crcs: set[int] = field(default_factory=set)
     names: set[str] = field(default_factory=set)   # parts that have no crc
+    part_names: dict[int, list[str]] = field(default_factory=dict)   # crc -> file names in the MRA
     # Several <rom> elements with the same index are either/or options (e.g. a
     # merged and a non-merged zip). Each option is the list of requirements of
     # one <rom>; zips then holds the union of all options' zips.
@@ -115,10 +120,15 @@ def parse_mra(data: bytes, rel_path: str) -> Game:
             pname = (part.get("name") or "").strip()
             if crc:
                 try:
-                    req.crcs.add(int(crc, 16))
-                    continue
+                    value = int(crc, 16)
                 except ValueError:
                     pass
+                else:
+                    req.crcs.add(value)
+                    names = req.part_names.setdefault(value, [])
+                    if pname and pname not in names:
+                        names.append(pname)
+                    continue
             if pname:
                 req.names.add(pname.lower())
         index = (rom.get("index") or "").strip() or ("noindex", n)
@@ -267,21 +277,29 @@ class LocalZip:
     kind: str   # "mame" or "hbmame"
 
 
-def scan_local(paths: list[tuple[str, str]]) -> tuple[dict[str, LocalZip], dict[str, LocalZip]]:
-    """Return (mame, hbmame) maps of lowercase zip name -> LocalZip."""
+def scan_local(paths: list[tuple[str, str, bool]]) -> tuple[dict[str, LocalZip], dict[str, LocalZip]]:
+    """Return (mame, hbmame) maps of lowercase zip name -> LocalZip.
+
+    paths are (dir, kind, required); earlier entries win on duplicate names.
+    Optional dirs (build_path) may be missing and don't count towards "no zips found".
+    """
     found: dict[str, dict[str, LocalZip]] = {MAME: {}, HBMAME: {}}
-    for root_dir, kind in paths:
+    required_found = 0
+    for root_dir, kind, required in paths:
         if not root_dir:
             continue
         if not os.path.isdir(root_dir):
-            raise SystemExit(f"error: local ROM path does not exist (not mounted?): {root_dir}")
+            if required:
+                raise SystemExit(f"error: local ROM path does not exist (not mounted?): {root_dir}")
+            continue
         for dirpath, _, files in os.walk(root_dir):
             for fn in files:
                 if fn.lower().endswith(".zip"):
                     found[kind].setdefault(fn.lower(), LocalZip(os.path.join(dirpath, fn), kind))
-    if not found[MAME] and not found[HBMAME]:
+                    required_found += required
+    if not required_found:
         raise SystemExit("error: no .zip files found in the configured local ROM path(s): "
-                         + ", ".join(p for p, _ in paths if p))
+                         + ", ".join(p for p, _, req in paths if p and req))
     return found[MAME], found[HBMAME]
 
 
@@ -315,6 +333,10 @@ class Resolver:
             if ref.key in self.local[kind]:
                 return self.local[kind][ref.key]
         return None
+
+    def register(self, where: str, path: str, contents: ZipContents):
+        """Pre-seed contents for a zip that doesn't exist yet (a planned rebuild)."""
+        self._cache[(where, path)] = contents
 
     def contents(self, where: str, path: str) -> ZipContents | None:
         k = (where, path)
@@ -382,6 +404,196 @@ class Resolver:
 
 
 # --------------------------------------------------------------------------
+# Rebuild missing zips from CRC-matching files in other local zips
+# --------------------------------------------------------------------------
+
+def cache_dir() -> str:
+    return os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "mister-rom-audit")
+
+
+class CrcIndex:
+    """CRC -> [(zip path, member name, size)] over local zips.
+
+    Only each zip's central directory is read. Results are cached on disk and
+    re-read only for zips whose size or mtime changed.
+    """
+
+    VERSION = 1
+
+    def __init__(self, cache_file: str | None = None):
+        self.cache_file = cache_file
+        self.by_crc: dict[int, list[tuple[str, str, int]]] = {}
+
+    def build(self, zip_paths: list[str]) -> int:
+        """Index zip_paths (in priority order); return how many zips had to be (re)read."""
+        cached: dict = {}
+        if self.cache_file:
+            try:
+                with open(self.cache_file) as f:
+                    data = json.load(f)
+                if data.get("version") == self.VERSION:
+                    cached = data["zips"]
+            except (OSError, ValueError, KeyError):
+                pass
+        fresh: dict = {}
+        reread = 0
+        for n, path in enumerate(zip_paths, 1):
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            entry = cached.get(path)
+            if not entry or entry[0] != st.st_size or entry[1] != st.st_mtime_ns:
+                try:
+                    with zipfile.ZipFile(path) as zf:
+                        members = [[i.CRC, i.filename, i.file_size] for i in zf.infolist() if not i.is_dir()]
+                except (zipfile.BadZipFile, OSError) as e:
+                    log(f"  skipping unreadable zip {path}: {e}")
+                    continue
+                entry = [st.st_size, st.st_mtime_ns, members]
+                reread += 1
+            fresh[path] = entry
+            for crc, name, size in entry[2]:
+                self.by_crc.setdefault(crc, []).append((path, name, size))
+            if n % 1000 == 0:
+                log(f"  {n}/{len(zip_paths)} zips indexed")
+        if self.cache_file and (reread or fresh.keys() != cached.keys()):
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            tmp = self.cache_file + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"version": self.VERSION, "zips": fresh}, f)
+            os.replace(tmp, self.cache_file)
+        return reread
+
+
+@dataclass
+class RebuildTarget:
+    """A zip named in an MRA that exists nowhere, and the parts it must contain."""
+    ref: ZipRef
+    crcs: set[int] = field(default_factory=set)
+    part_names: dict[int, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class RebuildPlan:
+    ref: ZipRef
+    members: list[tuple[str, str, str, int]]   # (name in new zip, source zip, source member, crc)
+    size: int                                   # uncompressed bytes
+
+    @property
+    def kind(self) -> str:
+        return HBMAME if self.ref.hint == HBMAME else MAME
+
+    @property
+    def sources(self) -> list[str]:
+        return sorted({os.path.basename(src) for _, src, _, _ in self.members})
+
+    def contents(self) -> ZipContents:
+        return ZipContents(crcs={m[3] for m in self.members}, names={m[0].lower() for m in self.members})
+
+
+def resolve_rebuild(target: RebuildTarget, index: CrcIndex) -> RebuildPlan | str:
+    """Find a local source for every required CRC, or explain what is missing."""
+    found = {c: index.by_crc[c] for c in target.crcs if c in index.by_crc}
+    missing = sorted(target.crcs - found.keys())
+    if missing:
+        shown = ", ".join(f"{c:08x}" for c in missing[:5]) + (", ..." if len(missing) > 5 else "")
+        return f"{len(found)}/{len(target.crcs)} parts found locally; missing CRCs {shown}"
+    # Take each part from the zip that covers the most parts (normally the parent
+    # set), so an unrelated file that merely shares a CRC32 isn't picked.
+    coverage = Counter(src for cands in found.values() for src in {c[0] for c in cands})
+    members, used, size = [], set(), 0
+    for crc in sorted(target.crcs):
+        src, member, fsize = max(found[crc], key=lambda c: coverage[c[0]])
+        for name in target.part_names.get(crc) or [f"{crc:08x}"]:
+            out = name if name.lower() not in used else f"{crc:08x}_{name}"
+            used.add(out.lower())
+            members.append((out, src, member, crc))
+            size += fsize
+    return RebuildPlan(target.ref, members, size)
+
+
+def plan_rebuilds(resolver: Resolver, games: list[Game], planned: dict[str, str], get_index):
+    """Plan zips to rebuild for requirements still unmet after the planned copies.
+
+    Returns (plans: zip key -> RebuildPlan, failures: requirement label -> [reason, game names]).
+    get_index() is only called when there is something to rebuild.
+    """
+    targets: dict[str, RebuildTarget] = {}
+    unmet = []   # (game, req, [(target keys | None, reason)] per option)
+
+    for g in games:
+        for req in g.reqs:
+            if req.beta or resolver.satisfied(req, planned, {}):
+                continue
+            options = []
+            for opt in req.alts or [[req]]:
+                leaves = [leaf for leaf in opt if not resolver.satisfied(leaf, planned, {})]
+                reason = None
+                for leaf in leaves:
+                    if any(z.key in planned or resolver.remote_path(z) for z in leaf.zips):
+                        reason = f"{leaf.label()}: zip exists but lacks parts (try --crc --fix-incomplete)"
+                    elif not leaf.crcs:
+                        reason = f"{leaf.label()}: MRA lists no part CRCs"
+                    elif leaf.names:
+                        reason = f"{leaf.label()}: some MRA parts have no CRC"
+                if reason:
+                    options.append((None, reason))
+                    continue
+                keys = []
+                for leaf in leaves:
+                    t = targets.setdefault(leaf.zips[0].key, RebuildTarget(leaf.zips[0]))
+                    t.crcs |= leaf.crcs
+                    for crc, names in leaf.part_names.items():
+                        have = t.part_names.setdefault(crc, [])
+                        have.extend(n for n in names if n not in have)
+                    keys.append(leaf.zips[0].key)
+                options.append((keys, None))
+            unmet.append((g, req, options))
+
+    resolved = {}
+    if targets:
+        index = get_index()
+        resolved = {k: resolve_rebuild(t, index) for k, t in targets.items()}
+
+    plans: dict[str, RebuildPlan] = {}
+    failures: dict[str, list] = {}
+    for g, req, options in unmet:
+        for keys, _ in options:
+            if keys is not None and all(isinstance(resolved[k], RebuildPlan) for k in keys):
+                plans.update((k, resolved[k]) for k in keys)
+                break
+        else:
+            reasons = []
+            for keys, reason in options:
+                reasons += [reason] if reason else [resolved[k] for k in keys if isinstance(resolved[k], str)]
+            entry = failures.setdefault(req.label(), ["; ".join(dict.fromkeys(reasons)), []])
+            entry[1].append(g.name)
+    return plans, failures
+
+
+def build_zip(plan: RebuildPlan, out_path: str):
+    """Write plan's members into a new zip at out_path (atomically)."""
+    tmp = out_path + ".tmp"
+    sources: dict[str, zipfile.ZipFile] = {}
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+            for name, src, member, crc in plan.members:
+                if src not in sources:
+                    sources[src] = zipfile.ZipFile(src)
+                data = sources[src].read(member)   # zipfile checks the stored CRC while reading
+                if zlib.crc32(data) != crc:
+                    raise ValueError(f"CRC mismatch for {member} in {src}")
+                out.writestr(name, data)
+        os.replace(tmp, out_path)
+    finally:
+        for zf in sources.values():
+            zf.close()
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# --------------------------------------------------------------------------
 # Reporting
 # --------------------------------------------------------------------------
 
@@ -419,6 +631,8 @@ def main(argv=None) -> int:
     ap.add_argument("--crc", action="store_true", help="verify zip contents against MRA part CRCs")
     ap.add_argument("--fix-incomplete", action="store_true",
                     help="with --crc: overwrite incomplete zips on MiSTer with a better local copy")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="build zips that exist nowhere from CRC-matching files in other local zips")
     ap.add_argument("--report", metavar="FILE", help="write a JSON report to FILE")
     ap.add_argument("-v", "--verbose", action="store_true", help="list every game in the report")
     args = ap.parse_args(argv)
@@ -429,13 +643,27 @@ def main(argv=None) -> int:
     mc, rc = cfg["mister"], cfg["roms"]
     dirs = {MAME: mc["mame_dir"], HBMAME: mc["hbmame_dir"]}
 
+    rom_paths = [os.path.expanduser(p) for p in (rc.get("path"), rc.get("hbmame_path")) if p]
+    build_path = os.path.abspath(os.path.expanduser(rc["build_path"])) if rc.get("build_path") else None
+    if build_path:
+        for p in rom_paths:
+            a, b = os.path.realpath(build_path), os.path.realpath(p)
+            if os.path.commonpath([a, b]) in (a, b):
+                raise SystemExit(f"error: roms.build_path must not be the same as, inside, or contain {p}")
+
     log("Scanning local ROMs ...")
-    local_mame, local_hb = scan_local([(rc.get("path"), MAME), (rc.get("hbmame_path"), HBMAME)])
+    local_mame, local_hb = scan_local([
+        (os.path.expanduser(rc["path"]) if rc.get("path") else None, MAME, True),
+        (os.path.expanduser(rc["hbmame_path"]) if rc.get("hbmame_path") else None, HBMAME, True),
+        (os.path.join(build_path, MAME) if build_path else None, MAME, False),
+        (os.path.join(build_path, HBMAME) if build_path else None, HBMAME, False),
+    ])
     local = {MAME: local_mame, HBMAME: local_hb}
     log(f"  {len(local_mame)} mame zips, {len(local_hb)} hbmame zips")
 
     log(f"Connecting to {mc.get('user', 'root')}@{mc['host']} ...")
     mister = Mister(mc)
+    tmp_dir = None
     try:
         log(f"Reading MRAs from {mc['mra_dir']} ...")
         rel_paths = mister.list_mras(mc["mra_dir"])
@@ -478,35 +706,80 @@ def main(argv=None) -> int:
         planned_copies = {k: lz.path for k, lz in copy_plan.items()}
         replace_plan = resolver.plan_replacements(games, planned_copies) if args.fix_incomplete else {}
 
+        # ---- rebuild zips that exist nowhere from parts in other local zips ----
+        rebuild_plans: dict[str, RebuildPlan] = {}
+        rebuild_failed: dict[str, list] = {}
+        rebuild_jobs: dict[str, LocalZip] = {}
+        if args.rebuild:
+            def get_index():
+                zip_paths = list(dict.fromkeys(lz.path for kind in (MAME, HBMAME) for lz in local[kind].values()))
+                log(f"Indexing {len(zip_paths)} local zips by CRC (cached after the first run) ...")
+                idx = CrcIndex(os.path.join(cache_dir(), "crc_index.json"))
+                log(f"  {idx.build(zip_paths)} zip(s) read, rest from cache")
+                return idx
+
+            planned_all = {**planned_copies, **{k: lz.path for k, lz in replace_plan.items()}}
+            rebuild_plans, rebuild_failed = plan_rebuilds(resolver, games, planned_all, get_index)
+            if rebuild_plans:
+                log(f"{'Would rebuild' if args.dry_run else 'Rebuilding'} {len(rebuild_plans)} zip(s) ...")
+            for key, plan in sorted(rebuild_plans.items()):
+                if args.dry_run:
+                    path = f"<rebuild>/{plan.ref.name}"
+                else:
+                    if build_path:
+                        out_dir = os.path.join(build_path, plan.kind)
+                    else:
+                        tmp_dir = tmp_dir or tempfile.mkdtemp(prefix="mister-rebuild-")
+                        out_dir = os.path.join(tmp_dir, plan.kind)
+                    os.makedirs(out_dir, exist_ok=True)
+                    path = os.path.join(out_dir, plan.ref.name)
+                    if os.path.exists(path):
+                        rebuild_failed[plan.ref.name] = [f"{path} already exists, not overwriting", []]
+                        continue
+                    log(f"  build {plan.ref.name} <- {', '.join(plan.sources)} ({len(plan.members)} files)")
+                    try:
+                        build_zip(plan, path)
+                    except (zipfile.BadZipFile, OSError, ValueError) as e:
+                        rebuild_failed[plan.ref.name] = [f"build failed: {e}", []]
+                        continue
+                resolver.register("local", path, plan.contents())
+                rebuild_jobs[key] = LocalZip(path, plan.kind)
+
         copied: dict[str, str] = {}
         replaced: dict[str, str] = {}
+        rebuilt: dict[str, str] = {}
         upload_errors: dict[str, str] = {}
-        bytes_sent = 0
-        jobs = [(k, lz, False) for k, lz in sorted(copy_plan.items())] + \
-               [(k, lz, True) for k, lz in sorted(replace_plan.items())]
+        sent = {"copy": 0, "replace": 0, "rebuild": 0}
+        jobs = [(k, lz, "copy") for k, lz in sorted(copy_plan.items())] + \
+               [(k, lz, "replace") for k, lz in sorted(replace_plan.items())] + \
+               [(k, lz, "rebuild") for k, lz in sorted(rebuild_jobs.items())]
         if jobs:
-            verb = "Would copy" if args.dry_run else "Copying"
+            verb = "Would upload" if args.dry_run else "Uploading"
             log(f"{verb} {len(jobs)} zip(s) ...")
-        for i, (key, lz, is_replace) in enumerate(jobs, 1):
-            if is_replace:
+        done = {"copy": copied, "replace": replaced, "rebuild": rebuilt}
+        for i, (key, lz, job) in enumerate(jobs, 1):
+            if job == "replace":
                 target = remote[MAME].get(key) or remote[HBMAME][key]
             else:
                 target = posixpath.join(dirs[lz.kind], os.path.basename(lz.path))
-            size = os.path.getsize(lz.path)
+            size = rebuild_plans[key].size if job == "rebuild" and args.dry_run else os.path.getsize(lz.path)
             if not args.dry_run:
-                log(f"  [{i}/{len(jobs)}] {'replace' if is_replace else 'copy'} {os.path.basename(lz.path)} ({human(size)})")
+                log(f"  [{i}/{len(jobs)}] {job} {os.path.basename(lz.path)} ({human(size)})")
                 try:
                     mister.ensure_dir(posixpath.dirname(target))
                     mister.upload(lz.path, target)
                 except (OSError, IOError) as e:
                     upload_errors[key] = str(e)
                     continue
-            (replaced if is_replace else copied)[key] = lz.path
-            bytes_sent += size
+            done[job][key] = lz.path
+            sent[job] += size
+        bytes_sent = sum(sent.values())
 
-        after = {g.mra: [resolver.satisfied(r, copied, replaced) for r in g.reqs] for g in games}
+        after = {g.mra: [resolver.satisfied(r, {**copied, **rebuilt}, replaced) for r in g.reqs] for g in games}
     finally:
         mister.close()
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # ---- classify games ----
     ok, fulfilled, still_missing, needs_beta = [], [], [], []
@@ -556,7 +829,7 @@ def main(argv=None) -> int:
     # ---- classify zip files ----
     referenced = {z for k in set_state for z in k}
     already = {k for k in referenced if k in remote[MAME] or k in remote[HBMAME]}
-    absent = referenced - already - set(copied)
+    absent = referenced - already - set(copied) - set(rebuilt)
     needed_zips = {z for k in sets_missing for z in k}
     absent_needed = absent & needed_zips
     absent_unneeded = absent - needed_zips
@@ -590,9 +863,14 @@ def main(argv=None) -> int:
     out.append("")
     row("Zip files referenced", len(referenced))
     row("on MiSTer", len(already), 3)
-    row("would copy" if args.dry_run else "copied", f"{len(copied)}  ({human(bytes_sent)})", 3)
+    row("would copy" if args.dry_run else "copied", f"{len(copied)}  ({human(sent['copy'])})", 3)
     if args.fix_incomplete:
         row("would replace" if args.dry_run else "replaced (incomplete)", len(replaced), 3)
+    if args.rebuild:
+        where = "kept in build_path" if build_path else "uploaded only, not kept"
+        size = f"~{human(sent['rebuild'])} uncompressed" if args.dry_run else human(sent["rebuild"])
+        row("would rebuild" if args.dry_run else "rebuilt", f"{len(rebuilt)}  ({size}, {where})", 3)
+        row("rebuild not possible", len(rebuild_failed), 3)
     row("absent fallbacks (not needed) *", len(absent_unneeded), 3)
     row("absent, needed", len(absent_needed), 3)
     row("upload errors", len(upload_errors), 3)
@@ -620,6 +898,14 @@ def main(argv=None) -> int:
             [f"{os.path.basename(p)}  <- {p}" for _, p in sorted(copied.items())])
     section("Replaced zips" if not args.dry_run else "Zips that would be replaced",
             [os.path.basename(p) for _, p in sorted(replaced.items())])
+    section("Zips that would be rebuilt" if args.dry_run else "Zips rebuilt from other local sets",
+            [f"{rebuild_plans[k].ref.name}  <- {', '.join(rebuild_plans[k].sources)} "
+             f"({len(rebuild_plans[k].members)} files)"
+             + (f"  saved to {p}" if build_path and not args.dry_run else "")
+             for k, p in sorted(rebuilt.items())])
+    section("Rebuild not possible",
+            [f"{label}: {reason}" + (f"  <- {_games_str(names)}" if names else "")
+             for label, (reason, names) in sorted(rebuild_failed.items())])
     section("Games fulfilled" if not args.dry_run else "Games that would be fulfilled",
             [f"{g.name}  [{g.mra}]" for g in sorted(fulfilled, key=lambda g: g.name.lower())])
     section("ROM sets still missing — no zip in the list found locally or on MiSTer",
@@ -660,6 +946,8 @@ def main(argv=None) -> int:
                 "zips_already_present": len(already),
                 "zips_copied": len(copied),
                 "zips_replaced": len(replaced),
+                "zips_rebuilt": len(rebuilt),
+                "rebuild_not_possible": len(rebuild_failed),
                 "zips_absent_not_needed": len(absent_unneeded),
                 "zips_absent_needed": len(absent_needed),
                 "bytes_copied": bytes_sent,
@@ -667,6 +955,14 @@ def main(argv=None) -> int:
             },
             "copied": sorted(os.path.basename(p) for p in copied.values()),
             "replaced": sorted(os.path.basename(p) for p in replaced.values()),
+            "rebuilt": [
+                {"zip": rebuild_plans[k].ref.name, "sources": rebuild_plans[k].sources,
+                 "files": len(rebuild_plans[k].members),
+                 "saved_to": p if build_path and not args.dry_run else None}
+                for k, p in sorted(rebuilt.items())
+            ],
+            "rebuild_not_possible": {label: {"reason": reason, "games": names}
+                                     for label, (reason, names) in rebuild_failed.items()},
             "games_fulfilled": [{"name": g.name, "mra": g.mra} for g in fulfilled],
             "games_need_beta_key_only": [{"name": g.name, "mra": g.mra} for g in needs_beta],
             "games_still_missing": [
