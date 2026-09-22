@@ -54,6 +54,15 @@ class CaseInsensitiveTest(unittest.TestCase):
         self.assertEqual(g.reqs[0].crcs, {0xA})
 
 
+class BetaKeyTest(unittest.TestCase):
+    def test_beta_requirement_flagged(self):
+        data = b'''<misterromdescription><name>SF3</name>
+          <rom index="0" zip="sfiii3n.zip|sfiii3.zip"><part crc="0000000a"/></rom>
+          <rom index="17" zip="jtbeta.zip" md5="None"/></misterromdescription>'''
+        g = parse_mra(data, "sf3.mra")
+        self.assertEqual([r.beta for r in g.reqs], [False, True])
+
+
 class ResolveTest(unittest.TestCase):
     def setUp(self):
         self.game = parse_mra(MRA, "msp.mra")

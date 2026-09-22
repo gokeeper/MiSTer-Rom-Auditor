@@ -40,6 +40,7 @@ The tool connects to your MiSTer over SSH. It reads every `.mra` file under `/me
 - **Optional CRC audit.** `--crc` checks that each zip actually contains the ROM parts the MRA asks for, so it catches wrong-version or incomplete sets. It reads only the zip's central directory, not the ROM data.
 - **Optional repair.** `--crc --fix-incomplete` overwrites MiSTer zips that fail the CRC check when your local copy covers more of the required parts.
 - **Tolerant MRA parsing.** Tag and attribute names are case-insensitive, like the MiSTer's own loader (e.g. `<rom>` … `</ROM>`).
+- **Jotego beta key aware.** `jtbeta.zip` (the Patreon key that unlocks Jotego's beta `jt*` cores) is reported on its own line instead of as a missing ROM set.
 - **JSON report** for scripting or keeping a history.
 
 ---
@@ -171,7 +172,8 @@ python mister_rom_audit.py --dry-run > audit.txt
  Games (MRAs needing zips)         : 3324
    OK before run                   : 3213
    would be fulfilled              : 44
-   still missing                   : 67
+   still missing ROMs              : 64
+   ROMs OK, need beta key only     : 3
 
  ROM sets (unique zip lists)       : 2956
    OK before run                   : 2883
@@ -184,6 +186,11 @@ python mister_rom_audit.py --dry-run > audit.txt
    absent fallbacks (not needed) * : 1907
    absent, needed                  : 40
    upload errors                   : 0
+
+ Jotego beta key (jtbeta.zip)      : absent
+   used by games                   : 3
+   not a MAME ROM: Jotego Patreon key that unlocks jt* beta cores;
+   put it in roms.path to have it copied.
 
  * a MRA zip list is a search path (e.g. game|parent|device); these zips are
    absent but every list that names them already has another zip present.
@@ -221,7 +228,8 @@ A zip list is a **search path**, not a list of required files. The MiSTer looks 
 | **no zip required** | MRAs with no `zip=` attribute, e.g. games with all ROM data inline. They are ignored. |
 | **Games: OK before run** | Every ROM set the MRA needs was already satisfied. |
 | **Games: fulfilled** | The game was broken before, and is complete after the copy. |
-| **Games: still missing** | At least one of the game's ROM sets is still unsatisfied. |
+| **Games: still missing ROMs** | At least one of the game's ROM sets is still unsatisfied. |
+| **Games: ROMs OK, need beta key only** | All ROMs are there, but the MRA also needs `jtbeta.zip` and it's absent (see below). |
 | **ROM sets: OK / fulfilled / still missing** | The same three states, counted per unique zip list. This is the number of distinct things you still need to obtain. |
 | **Zip files referenced** | Distinct zip names across all lists. |
 | **on MiSTer** | Referenced zips already in `mame_dir` or `hbmame_dir`. |
@@ -230,6 +238,23 @@ A zip list is a **search path**, not a list of required files. The MiSTer looks 
 | **absent, needed** | Not on the MiSTer or local, and named in a list that is still missing. Getting any one zip from each such list fixes it. |
 
 The four zip lines (on MiSTer + copied + absent fallbacks + absent needed) add up to **Zip files referenced**.
+
+### Jotego beta key (`jtbeta.zip`)
+
+Some MRAs for [Jotego](https://www.patreon.com/jotego)'s arcade cores contain an extra entry like:
+
+```xml
+<rom index="17" zip="jtbeta.zip" md5="None"/>
+```
+
+`jtbeta.zip` isn't a MAME ROM set. It is the key that unlocks Jotego's beta cores, distributed to Patreon supporters. Cores usually stop needing it once they're released publicly. The tool handles it separately:
+
+- It's left out of the **ROM sets** and **zip files** counts, so it doesn't inflate "still missing".
+- Games whose ROMs are complete but lack the key are counted as **ROMs OK, need beta key only**.
+- The **Jotego beta key** line shows whether the key is *on MiSTer*, *copied* or *absent*, and how many games use it.
+- If you have the key, put `jtbeta.zip` in `roms.path` and it's copied like any other zip.
+
+(`md5="None"` just means the MRA author didn't give a checksum for the assembled ROM, so the MiSTer skips that check. This tool doesn't use `md5` at all.)
 
 The report can have these sections:
 
@@ -325,7 +350,10 @@ CRC mode combines contents across all zips in the list, in the same way the MiST
     "games": 3324,
     "games_ok": 3213,
     "games_fulfilled": 44,
-    "games_still_missing": 67,
+    "games_still_missing": 64,
+    "games_need_beta_key_only": 3,
+    "beta_key": "absent",
+    "games_using_beta_key": 3,
     "rom_sets": 2956,
     "rom_sets_ok": 2883,
     "rom_sets_fulfilled": 34,
@@ -342,6 +370,7 @@ CRC mode combines contents across all zips in the list, in the same way the MiST
   "copied": ["1942.zip", "..."],
   "replaced": [],
   "games_fulfilled": [{"name": "1942 (Revision B)", "mra": "1942.mra"}],
+  "games_need_beta_key_only": [{"name": "Street Fighter III 3rd Strike ...", "mra": "_Arcade Offset/_CP System III/..."}],
   "games_still_missing": [
     {"name": "Galaga", "mra": "_alternatives/_Galaga/Galaga.mra", "unmet": ["galaga.zip"]}
   ],
@@ -364,7 +393,7 @@ The keys of `unavailable_zips` and `incomplete_zips` (and the entries of `rom_se
 | Code | Meaning |
 |---|---|
 | `0` | Every game is OK or was fulfilled, and there were no upload errors. |
-| `1` | At least one game is still missing ROMs, an upload failed, or the run aborted (config error, SSH failure; the message or traceback is printed to stderr). |
+| `1` | At least one game is still missing ROMs or the beta key, an upload failed, or the run aborted (config error, SSH failure; the message or traceback is printed to stderr). |
 | `2` | Invalid command-line arguments (e.g. `--fix-incomplete` without `--crc`). |
 
 This makes it easy to use in scripts, e.g. `python mister_rom_audit.py || notify-send "MiSTer ROMs incomplete"`.

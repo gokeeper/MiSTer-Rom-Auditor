@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 import yaml
 
 HBMAME = "hbmame"
+# Jotego beta-core unlock key (Patreon), referenced by jt* MRAs; not a MAME ROM set.
+BETA_KEY = "jtbeta.zip"
 MAME = "mame"
 
 
@@ -43,6 +45,10 @@ class Requirement:
     zips: list[ZipRef]
     crcs: set[int] = field(default_factory=set)
     names: set[str] = field(default_factory=set)   # parts that have no crc
+
+    @property
+    def beta(self) -> bool:
+        return all(z.key == BETA_KEY for z in self.zips)
 
     def label(self) -> str:
         return "|".join(z.name for z in self.zips)
@@ -477,20 +483,29 @@ def main(argv=None) -> int:
         mister.close()
 
     # ---- classify games ----
-    ok, fulfilled, still_missing = [], [], []
+    ok, fulfilled, still_missing, needs_beta = [], [], [], []
     for g in games:
         if all(before[g.mra]):
             ok.append(g)
         elif all(after[g.mra]):
             fulfilled.append(g)
+        elif all(a for r, a in zip(g.reqs, after[g.mra]) if not r.beta):
+            needs_beta.append(g)
         else:
             still_missing.append(g)
+    beta_users = [g for g in games if any(r.beta for r in g.reqs)]
+    if BETA_KEY in copied:
+        beta_status = "would copy" if args.dry_run else "copied"
+    elif remote[MAME].get(BETA_KEY) or remote[HBMAME].get(BETA_KEY):
+        beta_status = "on MiSTer"
+    else:
+        beta_status = "absent"
 
     unavailable: dict[str, list[str]] = {}
     incomplete: dict[str, list[str]] = {}
     for g in still_missing:
         for req, sat in zip(g.reqs, after[g.mra]):
-            if sat:
+            if sat or req.beta:
                 continue
             present = [z for z in req.zips if z.key in copied or z.key in replaced or resolver.remote_path(z)]
             bucket = incomplete if present else unavailable
@@ -501,6 +516,8 @@ def main(argv=None) -> int:
     set_label: dict[tuple[str, ...], str] = {}
     for g in games:
         for req, b, a in zip(g.reqs, before[g.mra], after[g.mra]):
+            if req.beta:
+                continue
             key = tuple(z.key for z in req.zips)
             set_label.setdefault(key, req.label())
             st = set_state.setdefault(key, [True, True])
@@ -536,7 +553,9 @@ def main(argv=None) -> int:
     row("Games (MRAs needing zips)", len(games))
     row("OK before run", len(ok), 3)
     row("would be fulfilled" if args.dry_run else "fulfilled by this run", len(fulfilled), 3)
-    row("still missing", len(still_missing), 3)
+    row("still missing ROMs", len(still_missing), 3)
+    if beta_users:
+        row("ROMs OK, need beta key only", len(needs_beta), 3)
     out.append("")
     row("ROM sets (unique zip lists)", len(set_state))
     row("OK before run", len(sets_ok), 3)
@@ -551,6 +570,13 @@ def main(argv=None) -> int:
     row("absent fallbacks (not needed) *", len(absent_unneeded), 3)
     row("absent, needed", len(absent_needed), 3)
     row("upload errors", len(upload_errors), 3)
+    if beta_users:
+        out.append("")
+        row(f"Jotego beta key ({BETA_KEY})", beta_status)
+        row("used by games", len(beta_users), 3)
+        if beta_status == "absent":
+            out.append("   not a MAME ROM: Jotego Patreon key that unlocks jt* beta cores;")
+            out.append("   put it in roms.path to have it copied.")
     out.append("")
     out.append(" * a MRA zip list is a search path (e.g. game|parent|device); these zips are")
     out.append("   absent but every list that names them is already satisfied by another zip."
@@ -580,6 +606,8 @@ def main(argv=None) -> int:
     if args.verbose:
         section("Games OK", [f"{g.name}  [{g.mra}]" for g in sorted(ok, key=lambda g: g.name.lower())])
         section("Games still missing", [f"{g.name}  [{g.mra}]" for g in sorted(still_missing, key=lambda g: g.name.lower())])
+        section("Games needing only the Jotego beta key",
+                [f"{g.name}  [{g.mra}]" for g in sorted(needs_beta, key=lambda g: g.name.lower())])
     out.append("")
     print("\n".join(out))
 
@@ -595,6 +623,9 @@ def main(argv=None) -> int:
                 "games_ok": len(ok),
                 "games_fulfilled": len(fulfilled),
                 "games_still_missing": len(still_missing),
+                "games_need_beta_key_only": len(needs_beta),
+                "beta_key": beta_status,
+                "games_using_beta_key": len(beta_users),
                 "rom_sets": len(set_state),
                 "rom_sets_ok": len(sets_ok),
                 "rom_sets_fulfilled": len(sets_fulfilled),
@@ -611,6 +642,7 @@ def main(argv=None) -> int:
             "copied": sorted(os.path.basename(p) for p in copied.values()),
             "replaced": sorted(os.path.basename(p) for p in replaced.values()),
             "games_fulfilled": [{"name": g.name, "mra": g.mra} for g in fulfilled],
+            "games_need_beta_key_only": [{"name": g.name, "mra": g.mra} for g in needs_beta],
             "games_still_missing": [
                 {"name": g.name, "mra": g.mra,
                  "unmet": [r.label() for r, s in zip(g.reqs, after[g.mra]) if not s]}
@@ -628,7 +660,7 @@ def main(argv=None) -> int:
             json.dump(report, f, indent=2)
         log(f"Report written to {args.report}")
 
-    return 1 if still_missing or upload_errors else 0
+    return 1 if still_missing or needs_beta or upload_errors else 0
 
 
 def _games_str(names: list[str], limit: int = 4) -> str:
