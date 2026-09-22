@@ -8,6 +8,8 @@ report of what was already there, what got fulfilled and what is still missing.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import shutil
 import os
@@ -148,6 +150,98 @@ def parse_mra(data: bytes, rel_path: str) -> Game:
     return Game(mra=rel_path, name=name, reqs=reqs)
 
 
+# Parsed MRAs are cached between runs. Bump this whenever parse_mra() or the
+# Requirement/Game structures change, so stale cache entries are re-parsed.
+MRA_CACHE_VERSION = 1
+
+
+def req_to_dict(r: Requirement) -> dict:
+    d = {"zips": [[z.key, z.name, z.hint] for z in r.zips]}
+    if r.crcs:
+        d["crcs"] = sorted(r.crcs)
+    if r.names:
+        d["names"] = sorted(r.names)
+    if r.part_names:
+        d["part_names"] = {str(k): v for k, v in r.part_names.items()}
+    if r.alts:
+        d["alts"] = [[req_to_dict(x) for x in opt] for opt in r.alts]
+    return d
+
+
+def req_from_dict(d: dict) -> Requirement:
+    return Requirement(
+        zips=[ZipRef(key=k, name=n, hint=h) for k, n, h in d["zips"]],
+        crcs=set(d.get("crcs", ())),
+        names=set(d.get("names", ())),
+        part_names={int(k): v for k, v in d.get("part_names", {}).items()},
+        alts=[[req_from_dict(x) for x in opt] for opt in d["alts"]] if "alts" in d else None,
+    )
+
+
+class MraCache:
+    """Parsed MRAs keyed by path, valid while the file's size and mtime are unchanged."""
+
+    def __init__(self, path: str | None):
+        self.path = path
+        self.entries: dict[str, dict] = {}
+        if path:
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if data.get("version") == MRA_CACHE_VERSION:
+                    self.entries = data["mras"]
+            except (OSError, ValueError, KeyError):
+                pass
+
+    def get(self, rel: str, stamp: tuple[int, int]) -> dict | None:
+        e = self.entries.get(rel)
+        return e if e and tuple(e["stamp"]) == stamp else None
+
+    def put(self, rel: str, stamp: tuple[int, int], game: Game | None, error: str | None):
+        e = {"stamp": list(stamp)}
+        if error is not None:
+            e["error"] = error
+        else:
+            e["name"] = game.name
+            e["reqs"] = [req_to_dict(r) for r in game.reqs]
+        self.entries[rel] = e
+
+    def save(self, keep: set[str]):
+        if not self.path:
+            return
+        self.entries = {k: v for k, v in self.entries.items() if k in keep}
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": MRA_CACHE_VERSION, "mras": self.entries}, f)
+        os.replace(tmp, self.path)
+
+
+def load_mras(mister, mra_dir: str, cache: MraCache):
+    """Return (games, no_rom, parse_errors, total), fetching only new/changed MRAs."""
+    stamps = mister.list_mras(mra_dir)
+    changed = [p for p, st in stamps.items() if cache.get(p, st) is None]
+    log(f"  {len(stamps)} MRAs: {len(stamps) - len(changed)} unchanged (cached), "
+        f"{len(changed)} new/changed to download")
+    raw = mister.read_mras(mra_dir, changed) if changed else {}
+    for p in changed:
+        try:
+            cache.put(p, stamps[p], parse_mra(raw[p], p), None)
+        except ET.ParseError as e:
+            cache.put(p, stamps[p], None, str(e))
+    cache.save(set(stamps))
+
+    games, no_rom, parse_errors = [], [], []
+    for p, st in stamps.items():
+        e = cache.get(p, st)
+        if "error" in e:
+            parse_errors.append((p, e["error"]))
+            continue
+        g = Game(mra=p, name=e["name"], reqs=[req_from_dict(d) for d in e["reqs"]])
+        (games if g.reqs else no_rom).append(g)
+    return games, no_rom, parse_errors, len(stamps)
+
+
 # --------------------------------------------------------------------------
 # Zip content helpers
 # --------------------------------------------------------------------------
@@ -200,19 +294,28 @@ class Mister:
         err = stderr.read()
         return stdout.channel.recv_exit_status(), out, err
 
-    def list_mras(self, mra_dir: str) -> list[str]:
-        code, out, err = self.run(f"cd {shlex.quote(mra_dir)} && find . -type f -iname '*.mra'")
+    def list_mras(self, mra_dir: str) -> dict[str, tuple[int, int]]:
+        """Return {relative path: (size, mtime)} for every MRA under mra_dir."""
+        code, out, err = self.run(f"cd {shlex.quote(mra_dir)} && "
+                                  "find . -type f -iname '*.mra' -exec stat -c '%s %Y %n' {} +")
         if code != 0:
             raise RuntimeError(f"cannot list MRAs in {mra_dir}: {err.decode(errors='replace').strip()}")
-        return sorted(line[2:] if line.startswith("./") else line
-                      for line in out.decode("utf-8", errors="surrogateescape").splitlines() if line)
+        result = {}
+        for line in out.decode("utf-8", errors="surrogateescape").splitlines():
+            size, mtime, path = line.split(" ", 2)
+            result[path[2:] if path.startswith("./") else path] = (int(size), int(mtime))
+        return dict(sorted(result.items()))
 
     def read_mras(self, mra_dir: str, rel_paths: list[str]) -> dict[str, bytes]:
-        """Fetch all MRAs in one tar stream, falling back to SFTP per file."""
+        """Fetch the given MRAs in one tar stream, falling back to SFTP per file."""
         result: dict[str, bytes] = {}
+        list_file = f"/tmp/mister-rom-audit-{os.getpid()}.lst"
         try:
-            cmd = (f"cd {shlex.quote(mra_dir)} && "
-                   "find . -type f -iname '*.mra' | tar -cf - -T - 2>/dev/null")
+            # File list goes via a temp file: piping it through stdin while
+            # reading the tar from stdout could deadlock on large lists.
+            self.sftp.putfo(io.BytesIO("".join(f"./{p}\n" for p in rel_paths)
+                                       .encode("utf-8", errors="surrogateescape")), list_file)
+            cmd = f"cd {shlex.quote(mra_dir)} && tar -cf - -T {list_file} 2>/dev/null"
             _, stdout, _ = self.ssh.exec_command(cmd)
             with tarfile.open(fileobj=stdout, mode="r|") as tf:
                 for member in tf:
@@ -225,6 +328,11 @@ class Mister:
                     result[path] = f.read()
         except (tarfile.TarError, OSError, EOFError):
             pass
+        finally:
+            try:
+                self.sftp.remove(list_file)
+            except OSError:
+                pass
         missing = [p for p in rel_paths if p not in result]
         if missing:
             if result:
@@ -633,6 +741,8 @@ def main(argv=None) -> int:
                     help="with --crc: overwrite incomplete zips on MiSTer with a better local copy")
     ap.add_argument("--rebuild", action="store_true",
                     help="build zips that exist nowhere from CRC-matching files in other local zips")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="ignore the MRA cache and download/parse every MRA again")
     ap.add_argument("--report", metavar="FILE", help="write a JSON report to FILE")
     ap.add_argument("-v", "--verbose", action="store_true", help="list every game in the report")
     args = ap.parse_args(argv)
@@ -666,17 +776,12 @@ def main(argv=None) -> int:
     tmp_dir = None
     try:
         log(f"Reading MRAs from {mc['mra_dir']} ...")
-        rel_paths = mister.list_mras(mc["mra_dir"])
-        raw = mister.read_mras(mc["mra_dir"], rel_paths)
-        games, parse_errors, no_rom = [], [], []
-        for p in rel_paths:
-            try:
-                g = parse_mra(raw[p], p)
-            except ET.ParseError as e:
-                parse_errors.append((p, str(e)))
-                continue
-            (games if g.reqs else no_rom).append(g)
-        log(f"  {len(rel_paths)} MRAs, {len(parse_errors)} parse errors")
+        cache_key = hashlib.sha1(f"{mc['host']}:{mc.get('port', 22)}:{mc['mra_dir']}".encode()).hexdigest()[:12]
+        cache = MraCache(os.path.join(cache_dir(), f"mra-{cache_key}.json"))
+        if args.no_cache:
+            cache.entries = {}
+        games, no_rom, parse_errors, mra_count = load_mras(mister, mc["mra_dir"], cache)
+        log(f"  {len(parse_errors)} parse errors")
 
         remote = {k: mister.list_zips(d) for k, d in dirs.items()}
         log(f"  MiSTer has {len(remote[MAME])} mame zips, {len(remote[HBMAME])} hbmame zips")
@@ -845,7 +950,7 @@ def main(argv=None) -> int:
     def row(label, value, indent=1):
         out.append(f"{' ' * indent}{label:<{35 - indent}}: {value}")
 
-    row("MRA files scanned", len(rel_paths))
+    row("MRA files scanned", mra_count)
     row("parse errors", len(parse_errors), 3)
     row("no zip required", len(no_rom), 3)
     out.append("")
@@ -928,7 +1033,7 @@ def main(argv=None) -> int:
             "dry_run": args.dry_run,
             "mode": mode,
             "summary": {
-                "mra_files": len(rel_paths),
+                "mra_files": mra_count,
                 "parse_errors": len(parse_errors),
                 "no_zip_required": len(no_rom),
                 "games": len(games),

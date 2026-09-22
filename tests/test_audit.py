@@ -209,6 +209,39 @@ class RebuildTest(unittest.TestCase):
         self.assertIn(crc(RING["r1.bin"]), again.by_crc)
 
 
+class MraCacheTest(unittest.TestCase):
+    def test_requirement_roundtrip(self):
+        import mister_rom_audit as m
+        for data in (MRA, SameIndexAlternativesTest.DATA, ring_mra()):
+            g = parse_mra(data, "x.mra")
+            self.assertEqual([m.req_from_dict(m.req_to_dict(r)) for r in g.reqs], g.reqs)
+
+    def test_only_new_or_changed_mras_are_downloaded(self):
+        import mister_rom_audit as m
+        files = {"a.mra": (MRA, (10, 1)), "b.mra": (b"<broken", (5, 1))}
+
+        class Fake:
+            fetched = []
+            def list_mras(self, d):
+                return {p: st for p, (_, st) in files.items()}
+            def read_mras(self, d, paths):
+                Fake.fetched.append(sorted(paths))
+                return {p: files[p][0] for p in paths}
+
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "mra.json")
+            games, no_rom, errors, n = m.load_mras(Fake(), "/x", m.MraCache(path))
+            self.assertEqual((len(games), len(errors), n), (1, 1, 2))
+            m.load_mras(Fake(), "/x", m.MraCache(path))
+            files["a.mra"] = (MRA, (10, 2))          # touched
+            files["c.mra"] = (ring_mra(), (7, 1))    # new
+            del files["b.mra"]                      # deleted
+            games, _, errors, n = m.load_mras(Fake(), "/x", m.MraCache(path))
+            self.assertEqual(Fake.fetched, [["a.mra", "b.mra"], ["a.mra", "c.mra"]])
+            self.assertEqual((sorted(g.mra for g in games), errors, n), (["a.mra", "c.mra"], [], 2))
+            self.assertEqual(games[0].reqs, parse_mra(MRA, "a.mra").reqs)
+
+
 class BuildPathSafetyTest(unittest.TestCase):
     def test_build_path_inside_collection_rejected(self):
         import mister_rom_audit as m

@@ -30,7 +30,8 @@ The tool connects to your MiSTer over SSH. It reads every `.mra` file under `/me
 
 ## Features
 
-- **Remote scan over SSH/SFTP.** Nothing is installed on the MiSTer. All MRAs are fetched in one `tar` stream, with a per-file SFTP fallback.
+- **Remote scan over SSH/SFTP.** Nothing is installed on the MiSTer. MRAs are fetched in one `tar` stream, with a per-file SFTP fallback.
+- **MRA cache.** Parsed MRAs are cached locally, and only new or changed MRAs are downloaded. On a 3300-MRA setup, reading MRAs drops from ~33 s to ~2 s after the first run.
 - **Understands zip search lists.** An MRA like `zip="galaga.zip|namco51.zip|namco54.zip"` lists the zips the MiSTer searches for ROM parts (game, parent, devices/BIOS). Without `--crc`, the game counts as OK if any one of them is present.
 - **Three levels of statistics.** Games (MRA files), ROM sets (unique zip lists, often shared by many MRAs) and individual zip files are counted separately.
 - **mame and hbmame.** Both `games/mame` and `games/hbmame` count as present locations. Zips found in your local hbmame folder are uploaded to `games/hbmame`.
@@ -167,6 +168,7 @@ python mister_rom_audit.py --dry-run > audit.txt
 | `--crc` | Also verify that each zip contains the CRCs listed in the MRA `<part>` entries. Slower: it opens every referenced zip on the MiSTer over SFTP. |
 | `--fix-incomplete` | Requires `--crc`. When a zip on the MiSTer fails the CRC check and your local zip of the same name covers more of the required parts, overwrite the MiSTer copy. **This overwrites files.** Try it with `--dry-run` first. |
 | `--rebuild` | For ROM sets still missing after copying, build the first zip in the MRA's list from CRC-matching files in your other local zips, then upload it. See [Rebuilding missing zips](#3-rebuilding-missing-zips). With `--dry-run`, only shows what would be built. |
+| `--no-cache` | Ignore the MRA cache: download and parse every MRA again (the cache is then rewritten). Normally not needed. |
 | `--report FILE` | Write a JSON report to `FILE`. |
 | `-v`, `--verbose` | Also list every OK game and every still-missing game by name. |
 
@@ -306,6 +308,16 @@ The report can have these sections:
                                                              │
                                             OK / fulfilled / still missing report
 ```
+
+### 0. Fetching MRAs (with cache)
+
+MRAs can be large: some embed megabytes of inline ROM data, and a typical `_Arcade` folder is over 100 MB. Downloading and parsing all of them takes about 30 s, so the results are cached:
+
+1. One `find … -exec stat` on the MiSTer lists every MRA with its size and modification time (about 1 s).
+2. MRAs whose size and mtime match the cache are taken from it, already parsed.
+3. Only new or changed MRAs are downloaded, in one `tar` stream, and parsed. Deleted MRAs are dropped from the cache.
+
+The cache lives in `~/.cache/mister-rom-audit/mra-<id>.json` (or under `$XDG_CACHE_HOME`), one file per MiSTer host and `mra_dir`. It is a few MB. It's safe to delete at any time; the next run simply downloads everything again. `--no-cache` does the same for one run.
 
 ### 1. MRA parsing
 
@@ -451,6 +463,9 @@ Check `user` and `password`. The stock MiSTer login is `root` / `1`. If you chan
 **`error: local ROM path does not exist (not mounted?)`** / **`error: no .zip files found`**
 `roms.path` (or `roms.hbmame_path`) points to a folder that doesn't exist or contains no zips. Usually the NAS or USB drive isn't mounted, or the config still has the example path. The tool stops here instead of reporting every game as missing.
 
+**Results look stale after editing an MRA**
+Changes are detected by file size and modification time. If a tool rewrote an MRA while preserving both, run once with `--no-cache`.
+
 **`cannot list MRAs in /media/fat/_Arcade`**
 Check `mister.mra_dir`. MRAs live in `_Arcade/`. `_Arcade/cores/` holds only `.rbf` cores.
 
@@ -505,6 +520,7 @@ The tests cover:
 - MRA parsing: zip search lists, interleaved parts, per-part `zip` overrides, `hbmame/` prefix hints, mixed-case tags
 - existence-mode copy planning
 - CRC-mode evaluation and `--fix-incomplete` replacement planning
+- MRA cache: serialization round-trip, and only new/changed MRAs downloaded, deleted ones dropped
 - `--rebuild`: CRC index and cache, donor preference, partial-match reporting, either/or options, zip building, `build_path` safety check
 
 ### Project layout
