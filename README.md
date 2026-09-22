@@ -31,7 +31,8 @@ The tool connects to your MiSTer over SSH. It reads every `.mra` file under `/me
 ## Features
 
 - **Remote scan over SSH/SFTP.** Nothing is installed on the MiSTer. All MRAs are fetched in one `tar` stream, with a per-file SFTP fallback.
-- **Handles alternative zips.** An MRA like `zip="mspacmnf.zip|mspacman.zip"` lists interchangeable zips. The game is OK if any one of them is present.
+- **Understands zip search lists.** An MRA like `zip="galaga.zip|namco51.zip|namco54.zip"` lists the zips the MiSTer searches for ROM parts (game, parent, devices/BIOS). Without `--crc`, the game counts as OK if any one of them is present.
+- **Three levels of statistics.** Games (MRA files), ROM sets (unique zip lists, often shared by many MRAs) and individual zip files are counted separately.
 - **mame and hbmame.** Both `games/mame` and `games/hbmame` count as present locations. Zips found in your local hbmame folder are uploaded to `games/hbmame`.
 - **Safe uploads.** Each file is uploaded as `name.zip.part` and renamed when complete, so an interrupted run never leaves a truncated zip.
 - **Deduplicated.** Each zip is uploaded at most once, even if dozens of MRAs reference it.
@@ -157,37 +158,59 @@ python mister_rom_audit.py --dry-run > audit.txt
 
 ## Example output
 
-(The numbers are illustrative.)
+(Numbers from a real dry run. The copy count is illustrative.)
 
 ```
 ================================================================
- MiSTer ROM audit  —  mode: existence
+ MiSTer ROM audit (dry run)  —  mode: existence
 ================================================================
- MRA files scanned            : 3120
-   parse errors               : 0
-   no zip required            : 4
- Unique zips referenced       : 1987
-   already on MiSTer          : 1702
-   copied                     : 241  (1.3 GB)
-   upload errors              : 0
- Games (MRAs needing zips)    : 3116
-   OK before run              : 2811
-   fulfilled by this run      : 262
-   still missing              : 43
+ MRA files scanned                 : 3331
+   parse errors                    : 0
+   no zip required                 : 7
 
---- Copied zips (241) ---
+ Games (MRAs needing zips)         : 3324
+   OK before run                   : 3213
+   would be fulfilled              : 44
+   still missing                   : 67
+
+ ROM sets (unique zip lists)       : 2956
+   OK before run                   : 2883
+   would be fulfilled              : 34
+   still missing                   : 39
+
+ Zip files referenced              : 3004
+   on MiSTer                       : 1013
+   would copy                      : 44  (173.9 MB)
+   absent fallbacks (not needed) * : 1907
+   absent, needed                  : 40
+   upload errors                   : 0
+
+ * a MRA zip list is a search path (e.g. game|parent|device); these zips are
+   absent but every list that names them already has another zip present.
+   Without --crc that is not verified (split sets may still need them).
+
+--- Zips that would be copied (44) ---
   1942.zip  <- /mnt/roms/mame/1942.zip
   ...
 
---- Games fulfilled (262) ---
-  1942 (Revision B)  [1942.mra]
-  ...
-
---- Still missing — zip not found locally or on MiSTer (31) ---
-  galaga.zip  <- Galaga
-  mspacmnf.zip|mspacman.zip  <- Ms. Pac-Man (bootleg), Ms. Pac-Man Plus
+--- ROM sets still missing — no zip in the list found locally or on MiSTer (39) ---
+  aerofgt.zip  <- Aero Fighters (FF, Video System, 1992)
+  atarisy1.zip  <- Indiana Jones (cocktail), Indiana Jones (german), Indiana Jones (set 1), +23 more
+  bigbang.zip|tdragon2.zip  <- Big Bang (9th Nov. 1993, set 1)
   ...
 ```
+
+### Games vs. ROM sets vs. zip files
+
+These three counts measure different things, so their numbers differ:
+
+| Term | What it is | Why its count differs |
+|---|---|---|
+| **Game** | One `.mra` file. | Many MRAs share a ROM set: `puckman.zip` alone is used by ~130 Pac-Man hacks, and alternative versions of a game usually share one too. |
+| **ROM set** | One unique `zip="…"` list, e.g. `galaga.zip\|namco51.zip\|namco54.zip`. It is counted once however many MRAs use it. | One MRA can reference several sets, e.g. a `<part zip="…">` override. |
+| **Zip file** | One file name that appears in any list. | A list names several zips, and the same zip (a parent or a BIOS like `neogeo.zip`) appears in many lists. |
+
+A zip list is a **search path**, not a list of required files. The MiSTer looks for each ROM part in every zip in the list. With **non-merged** sets, the first zip usually contains everything, so the parent and device zips after it are never opened. That is why most referenced zip names can be absent without anything being broken.
 
 ### What the numbers mean
 
@@ -196,17 +219,22 @@ python mister_rom_audit.py --dry-run > audit.txt
 | **MRA files scanned** | Regular `.mra` files found under `mra_dir`. Symlinks such as the `_Organized` folders created by update_all are skipped, so games aren't counted twice. |
 | **parse errors** | MRAs that aren't valid XML even after case normalisation. These are listed at the bottom. |
 | **no zip required** | MRAs with no `zip=` attribute, e.g. games with all ROM data inline. They are ignored. |
-| **Unique zips referenced** | Distinct zip names mentioned across all MRAs, alternatives included. |
-| **already on MiSTer** | Referenced zips that already exist in `mame_dir` or `hbmame_dir`. |
+| **Games: OK before run** | Every ROM set the MRA needs was already satisfied. |
+| **Games: fulfilled** | The game was broken before, and is complete after the copy. |
+| **Games: still missing** | At least one of the game's ROM sets is still unsatisfied. |
+| **ROM sets: OK / fulfilled / still missing** | The same three states, counted per unique zip list. This is the number of distinct things you still need to obtain. |
+| **Zip files referenced** | Distinct zip names across all lists. |
+| **on MiSTer** | Referenced zips already in `mame_dir` or `hbmame_dir`. |
 | **copied** | Zips uploaded in this run, with total size. |
-| **OK before run** | Games whose requirements were already met before anything was copied. |
-| **fulfilled by this run** | Games that were broken before and are complete after the upload. |
-| **still missing** | Games that still can't be satisfied. See the "Still missing" sections for the zips they need. |
+| **absent fallbacks (not needed)** | Not on the MiSTer, but every list that names them is satisfied by another zip. Without `--crc` this is assumed, not verified. |
+| **absent, needed** | Not on the MiSTer or local, and named in a list that is still missing. Getting any one zip from each such list fixes it. |
+
+The four zip lines (on MiSTer + copied + absent fallbacks + absent needed) add up to **Zip files referenced**.
 
 The report can have these sections:
 
-- **Still missing — zip not found locally or on MiSTer**: none of the listed zips exist anywhere. You need to obtain one of them.
-- **Still missing — zip present but CRCs don't match** (`--crc` only): a zip exists but doesn't contain the right ROM parts. Usually this is a different MAME version of the set.
+- **ROM sets still missing — no zip in the list found locally or on MiSTer**: none of the listed zips exist anywhere. You need to obtain one of them. Each line shows the games that use the set.
+- **ROM sets still missing — zip present but CRCs don't match** (`--crc` only): a zip exists but doesn't contain the right ROM parts. Usually this is a different MAME version of the set.
 - **Upload errors**: SFTP failures, such as a full disk or a permission problem.
 - **Unreadable zips** (`--crc` only): corrupt zips, on the MiSTer or local.
 - **MRA parse errors**: MRAs that couldn't be read.
@@ -241,7 +269,7 @@ The report can have these sections:
 
 In each MRA, every `<rom>` element that has a `zip="…"` attribute becomes a **requirement**:
 
-- `zip="a.zip|b.zip"` is split on `|` into alternatives. Any one present satisfies the requirement in existence mode.
+- `zip="a.zip|b.zip"` is split on `|` into a search list (game, parent, devices/BIOS). The MiSTer looks for each part in all of them. In existence mode, one present zip satisfies the requirement. `--crc` checks the parts properly.
 - A path prefix such as `hbmame/foo.zip` or `mame/foo.zip` is kept as a hint for where to look and where to upload.
 - Every `<part crc="…">` inside the `<rom>` (including parts nested in `<interleave>`) adds a required CRC. A part without a CRC but with a `name` adds a required file name.
 - A `<part zip="other.zip">` with its own `zip` attribute starts a separate requirement for that zip.
@@ -253,11 +281,11 @@ The game name comes from the MRA's `<name>` element, or from the file name if th
 
 A zip is uploaded when all of these are true:
 
-- some MRA references it (as any alternative),
+- some MRA references it (anywhere in a zip list),
 - it is not in `mame_dir` or `hbmame_dir` on the MiSTer,
 - a zip with the same name (case-insensitive) exists in your local ROM folders.
 
-All missing alternatives are copied, not just the first one. With **split** ROM sets, a clone zip such as `mspacmnf.zip` only works when its parent `mspacman.zip` is also present, and a name-only check can't tell whether that's needed. Parent zips are shared by many games, so the extra disk use is small.
+Every missing zip in the list is copied, not just the first one. With **split** ROM sets, a clone zip such as `mspacmnf.zip` only works when its parent `mspacman.zip` is also present, and a name-only check can't tell whether that's needed. Parent zips are shared by many games, so the extra disk use is small.
 
 Upload destination:
 
@@ -272,7 +300,7 @@ Upload destination:
 | Speed | fast: one directory listing per ROM folder | slower: opens every referenced zip over SFTP to read its directory |
 | Catches | missing zips | missing zips, wrong MAME version, incomplete or corrupt sets |
 
-CRC mode combines contents across all listed alternatives, in the same way the MiSTer loader searches every listed zip for each part. A split child plus its parent is therefore evaluated correctly.
+CRC mode combines contents across all zips in the list, in the same way the MiSTer loader searches every listed zip for each part. A split child plus its parent is therefore evaluated correctly.
 
 ### 4. Game status
 
@@ -291,19 +319,25 @@ CRC mode combines contents across all listed alternatives, in the same way the M
   "dry_run": false,
   "mode": "existence",
   "summary": {
-    "mra_files": 3120,
+    "mra_files": 3331,
     "parse_errors": 0,
-    "no_zip_required": 4,
-    "zips_referenced": 1987,
-    "zips_already_present": 1702,
-    "zips_copied": 241,
+    "no_zip_required": 7,
+    "games": 3324,
+    "games_ok": 3213,
+    "games_fulfilled": 44,
+    "games_still_missing": 67,
+    "rom_sets": 2956,
+    "rom_sets_ok": 2883,
+    "rom_sets_fulfilled": 34,
+    "rom_sets_still_missing": 39,
+    "zips_referenced": 3004,
+    "zips_already_present": 1013,
+    "zips_copied": 44,
     "zips_replaced": 0,
-    "bytes_copied": 1395864371,
-    "upload_errors": 0,
-    "games": 3116,
-    "games_ok": 2811,
-    "games_fulfilled": 262,
-    "games_still_missing": 43
+    "zips_absent_not_needed": 1907,
+    "zips_absent_needed": 40,
+    "bytes_copied": 182347366,
+    "upload_errors": 0
   },
   "copied": ["1942.zip", "..."],
   "replaced": [],
@@ -311,6 +345,8 @@ CRC mode combines contents across all listed alternatives, in the same way the M
   "games_still_missing": [
     {"name": "Galaga", "mra": "_alternatives/_Galaga/Galaga.mra", "unmet": ["galaga.zip"]}
   ],
+  "rom_sets_still_missing": ["aerofgt.zip", "bigbang.zip|tdragon2.zip"],
+  "absent_needed_zips": ["aerofgt.zip", "bigbang.zip", "tdragon2.zip"],
   "unavailable_zips": {"galaga.zip": ["Galaga"]},
   "incomplete_zips": {},
   "upload_errors": {},
@@ -319,7 +355,7 @@ CRC mode combines contents across all listed alternatives, in the same way the M
 }
 ```
 
-The keys of `unavailable_zips` and `incomplete_zips` are requirement labels, i.e. the alternatives joined with `|`.
+The keys of `unavailable_zips` and `incomplete_zips` (and the entries of `rom_sets_still_missing`) are ROM-set labels: the zip list joined with `|`.
 
 ---
 
@@ -366,7 +402,7 @@ The SD card or USB drive is full. The partial `.part` file is left behind and ca
 
 - Only zips directly inside `mame_dir` / `hbmame_dir` count as present. Sub-folders there are not searched.
 - Local zips are matched **by file name only**. In existence mode a zip with the right name but wrong contents counts as good; use `--crc` to catch that.
-- Merged sets: if the MRA doesn't list your merged parent zip as an alternative, the tool can't know that the parent contains the clone.
+- Merged sets: if the MRA's zip list doesn't include your merged parent zip, the tool can't know that the parent contains the clone.
 - CHDs, samples and other non-zip assets are not handled.
 - Symlinked MRAs are skipped by design, to avoid counting `_Organized` duplicates.
 - SSH host keys are not verified.
@@ -383,7 +419,7 @@ python -m unittest discover -s tests -v
 
 The tests cover:
 
-- MRA parsing: alternatives, interleaved parts, per-part `zip` overrides, `hbmame/` prefix hints, mixed-case tags
+- MRA parsing: zip search lists, interleaved parts, per-part `zip` overrides, `hbmame/` prefix hints, mixed-case tags
 - existence-mode copy planning
 - CRC-mode evaluation and `--fix-incomplete` replacement planning
 

@@ -496,8 +496,27 @@ def main(argv=None) -> int:
             bucket = incomplete if present else unavailable
             bucket.setdefault(req.label(), []).append(g.name)
 
-    referenced = {z.key for g in games for r in g.reqs for z in r.zips}
+    # ---- classify ROM sets (unique zip search lists, shared by many MRAs) ----
+    set_state: dict[tuple[str, ...], list[bool]] = {}   # key -> [ok_before, ok_after]
+    set_label: dict[tuple[str, ...], str] = {}
+    for g in games:
+        for req, b, a in zip(g.reqs, before[g.mra], after[g.mra]):
+            key = tuple(z.key for z in req.zips)
+            set_label.setdefault(key, req.label())
+            st = set_state.setdefault(key, [True, True])
+            st[0] &= b
+            st[1] &= a
+    sets_ok = [k for k, (b, _) in set_state.items() if b]
+    sets_fulfilled = [k for k, (b, a) in set_state.items() if not b and a]
+    sets_missing = [k for k, (_, a) in set_state.items() if not a]
+
+    # ---- classify zip files ----
+    referenced = {z for k in set_state for z in k}
     already = {k for k in referenced if k in remote[MAME] or k in remote[HBMAME]}
+    absent = referenced - already - set(copied)
+    needed_zips = {z for k in sets_missing for z in k}
+    absent_needed = absent & needed_zips
+    absent_unneeded = absent - needed_zips
 
     # ---- print ----
     dry = " (dry run)" if args.dry_run else ""
@@ -508,21 +527,36 @@ def main(argv=None) -> int:
     out.append(f" MiSTer ROM audit{dry}  —  mode: {mode}")
     out.append("=" * 64)
     def row(label, value, indent=1):
-        out.append(f"{' ' * indent}{label:<{30 - indent}}: {value}")
+        out.append(f"{' ' * indent}{label:<{35 - indent}}: {value}")
 
     row("MRA files scanned", len(rel_paths))
     row("parse errors", len(parse_errors), 3)
     row("no zip required", len(no_rom), 3)
-    row("Unique zips referenced", len(referenced))
-    row("already on MiSTer", len(already), 3)
-    row("would copy" if args.dry_run else "copied", f"{len(copied)}  ({human(bytes_sent)})", 3)
-    if args.fix_incomplete:
-        row("would replace" if args.dry_run else "replaced (incomplete)", len(replaced), 3)
-    row("upload errors", len(upload_errors), 3)
+    out.append("")
     row("Games (MRAs needing zips)", len(games))
     row("OK before run", len(ok), 3)
     row("would be fulfilled" if args.dry_run else "fulfilled by this run", len(fulfilled), 3)
     row("still missing", len(still_missing), 3)
+    out.append("")
+    row("ROM sets (unique zip lists)", len(set_state))
+    row("OK before run", len(sets_ok), 3)
+    row("would be fulfilled" if args.dry_run else "fulfilled by this run", len(sets_fulfilled), 3)
+    row("still missing", len(sets_missing), 3)
+    out.append("")
+    row("Zip files referenced", len(referenced))
+    row("on MiSTer", len(already), 3)
+    row("would copy" if args.dry_run else "copied", f"{len(copied)}  ({human(bytes_sent)})", 3)
+    if args.fix_incomplete:
+        row("would replace" if args.dry_run else "replaced (incomplete)", len(replaced), 3)
+    row("absent fallbacks (not needed) *", len(absent_unneeded), 3)
+    row("absent, needed", len(absent_needed), 3)
+    row("upload errors", len(upload_errors), 3)
+    out.append("")
+    out.append(" * a MRA zip list is a search path (e.g. game|parent|device); these zips are")
+    out.append("   absent but every list that names them is already satisfied by another zip."
+               if args.crc else
+               "   absent but every list that names them already has another zip present.\n"
+               "   Without --crc that is not verified (split sets may still need them).")
 
     def section(title, rows):
         if rows:
@@ -536,9 +570,9 @@ def main(argv=None) -> int:
             [os.path.basename(p) for _, p in sorted(replaced.items())])
     section("Games fulfilled" if not args.dry_run else "Games that would be fulfilled",
             [f"{g.name}  [{g.mra}]" for g in sorted(fulfilled, key=lambda g: g.name.lower())])
-    section("Still missing — zip not found locally or on MiSTer",
+    section("ROM sets still missing — no zip in the list found locally or on MiSTer",
             [f"{z}  <- {_games_str(names)}" for z, names in sorted(unavailable.items())])
-    section("Still missing — zip present but CRCs don't match",
+    section("ROM sets still missing — zip present but CRCs don't match",
             [f"{z}  <- {_games_str(names)}" for z, names in sorted(incomplete.items())])
     section("Upload errors", [f"{k}: {v}" for k, v in sorted(upload_errors.items())])
     section("Unreadable zips", [f"{k}: {v}" for k, v in sorted(bad_zips.items())])
@@ -557,16 +591,22 @@ def main(argv=None) -> int:
                 "mra_files": len(rel_paths),
                 "parse_errors": len(parse_errors),
                 "no_zip_required": len(no_rom),
-                "zips_referenced": len(referenced),
-                "zips_already_present": len(already),
-                "zips_copied": len(copied),
-                "zips_replaced": len(replaced),
-                "bytes_copied": bytes_sent,
-                "upload_errors": len(upload_errors),
                 "games": len(games),
                 "games_ok": len(ok),
                 "games_fulfilled": len(fulfilled),
                 "games_still_missing": len(still_missing),
+                "rom_sets": len(set_state),
+                "rom_sets_ok": len(sets_ok),
+                "rom_sets_fulfilled": len(sets_fulfilled),
+                "rom_sets_still_missing": len(sets_missing),
+                "zips_referenced": len(referenced),
+                "zips_already_present": len(already),
+                "zips_copied": len(copied),
+                "zips_replaced": len(replaced),
+                "zips_absent_not_needed": len(absent_unneeded),
+                "zips_absent_needed": len(absent_needed),
+                "bytes_copied": bytes_sent,
+                "upload_errors": len(upload_errors),
             },
             "copied": sorted(os.path.basename(p) for p in copied.values()),
             "replaced": sorted(os.path.basename(p) for p in replaced.values()),
@@ -576,6 +616,8 @@ def main(argv=None) -> int:
                  "unmet": [r.label() for r, s in zip(g.reqs, after[g.mra]) if not s]}
                 for g in still_missing
             ],
+            "rom_sets_still_missing": [set_label[k] for k in sorted(sets_missing)],
+            "absent_needed_zips": sorted(absent_needed),
             "unavailable_zips": unavailable,
             "incomplete_zips": incomplete,
             "upload_errors": upload_errors,
